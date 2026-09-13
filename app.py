@@ -75,7 +75,7 @@ with st.expander("📘 Complete strategy", expanded=False):
 with st.expander("⚙️ Symbol / security configuration", expanded=False):
     st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
 if engine.last_error:
-    st.warning(engine.last_error)
+    st.info(engine.last_error)
 else:
     st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
 st.caption(f"Dashboard time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
