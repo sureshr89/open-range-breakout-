@@ -1,13 +1,12 @@
 import streamlit as st
 from datetime import datetime
 import time as time_module
-import pandas as pd
 from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine
 
 st.set_page_config(page_title="ORB Strategy Dashboard", page_icon="📈", layout="wide")
 
-# Refresh the dashboard every 15 seconds while the page is open.
+# Automatic refresh every 15 seconds. No manual refresh button is needed.
 refresh_count = st_autorefresh(interval=15_000, key="orb_live_refresh")
 
 st.title("📈 ORB Strategy Dashboard")
@@ -34,21 +33,15 @@ with st.sidebar:
 engine = ORBEngine(client_id=client_id, access_token=access_token, risk_per_trade=per_trade_risk,
                    max_daily_loss=max_day_loss, target_rr=target_rr)
 
-# IMPORTANT: the engine uses the same Dhan client for snapshot, market table,
-# BUY setups and SELL setups. Cache the LTP response once per refresh cycle so
-# all sections reuse one API response instead of making duplicate requests.
+# Reuse one LTP response during each 15-second refresh cycle.
 _original_ltp = engine.dhan.ltp
 _ltp_cache = {"time": 0.0, "response": None}
 _ltp_cache_ttl = 15.0
 
 def cached_ltp(securities):
     now = time_module.monotonic()
-    if (
-        _ltp_cache["response"] is not None
-        and now - _ltp_cache["time"] < _ltp_cache_ttl
-    ):
+    if _ltp_cache["response"] is not None and now - _ltp_cache["time"] < _ltp_cache_ttl:
         return _ltp_cache["response"]
-
     response = _original_ltp(securities)
     _ltp_cache["response"] = response
     _ltp_cache["time"] = now
@@ -56,22 +49,23 @@ def cached_ltp(securities):
 
 engine.dhan.ltp = cached_ltp
 
-if st.button("🔄 Refresh now", type="primary", use_container_width=True):
-    st.rerun()
-
 status = engine.snapshot()
 
-cols = st.columns(6)
+cols = st.columns(4)
 metrics = [
-    ("Last traded price", status.get("nifty500_ltp"), status.get("nifty500_change")),
-    ("PDC", status.get("pdc"), None),
-    ("1W Close", status.get("week_close"), None),
-    ("1M Close", status.get("month_close"), None),
-    ("3M Close", status.get("quarter_close"), None),
+    ("NIFTY market LTP", status.get("nifty500_ltp"), None),
+    ("Previous-day close", status.get("pdc"), None),
+    ("Today % vs PDC", status.get("nifty500_change_pct"), "%"),
     ("Daily P&L", status.get("daily_pnl"), None),
 ]
-for c, (label, value, delta) in zip(cols, metrics):
-    c.metric(label, "—" if value is None else f"{value:,.2f}", delta=None if delta is None else f"{delta:+.2f}")
+for c, (label, value, suffix) in zip(cols, metrics):
+    if value is None:
+        display = "—"
+    elif suffix == "%":
+        display = f"{value:+.2f}%"
+    else:
+        display = f"{value:,.2f}"
+    c.metric(label, display)
 
 st.subheader("Live market data")
 st.dataframe(engine.market_table(), use_container_width=True, hide_index=True)
