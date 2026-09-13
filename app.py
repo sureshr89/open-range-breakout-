@@ -6,37 +6,80 @@ from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine, market_open
 
 st.set_page_config(page_title='ORB Strategy Dashboard', page_icon='📈', layout='wide')
-refresh_count=st_autorefresh(interval=15_000,key='orb_live_refresh')
-IST=ZoneInfo('Asia/Kolkata')
+refresh_count = st_autorefresh(interval=15_000, key='orb_live_refresh')
+IST = ZoneInfo('Asia/Kolkata')
+
 st.title('📈 ORB Strategy Dashboard')
 st.caption('NIFTY 500 • Paper trading only • 15-second refresh')
+
 with st.sidebar:
- st.header('Dhan connection'); client_id=str(st.secrets.get('DHAN_CLIENT_ID','') or '').strip(); token=str(st.secrets.get('DHAN_ACCESS_TOKEN','') or '').strip()
- st.success('Dhan secrets loaded') if client_id and token else st.error('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
- st.divider(); st.subheader('Risk controls')
- risk=st.number_input('Risk / trade (₹)',1.0,100000.0,2250.0,50.0); max_loss=st.number_input('Max daily loss (₹)',1.0,1000000.0,5000.0,500.0); rr=st.number_input('Target R:R',1.0,10.0,2.0,0.5)
- st.checkbox('Paper trading',value=True,disabled=True); st.caption('Live order placement is disabled.'); st.caption(f'Refresh #{refresh_count} • every 15 seconds')
+    st.header('Dhan connection')
+    client_id = str(st.secrets.get('DHAN_CLIENT_ID', '') or '').strip()
+    token = str(st.secrets.get('DHAN_ACCESS_TOKEN', '') or '').strip()
+    if client_id and token:
+        st.success('Dhan secrets loaded')
+    else:
+        st.error('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
+
+    st.divider()
+    st.subheader('Risk controls')
+    risk = st.number_input('Risk / trade (₹)', 1.0, 100000.0, 2250.0, 50.0)
+    max_loss = st.number_input('Max daily loss (₹)', 1.0, 1000000.0, 5000.0, 500.0)
+    rr = st.number_input('Target R:R', 1.0, 10.0, 2.0, 0.5)
+    st.checkbox('Paper trading', value=True, disabled=True)
+    st.caption('Live order placement is disabled.')
+    st.caption(f'Refresh #{refresh_count} • every 15 seconds')
+
+
 @st.cache_resource(show_spinner=False)
-def get_engine(cid,tok,r,loss,target): return ORBEngine(cid,tok,r,loss,target)
-engine=get_engine(client_id,token,risk,max_loss,rr)
+def get_engine(cid, tok, r, loss, target):
+    return ORBEngine(cid, tok, r, loss, target)
+
+
+engine = get_engine(client_id, token, risk, max_loss, rr)
+
 if not market_open():
- st.warning('NSE market closed — live Dhan requests are disabled.')
- frame=pd.DataFrame({'Status':['NSE market closed — live Dhan requests are disabled.']})
+    st.warning('NSE market closed — live Dhan requests are disabled.')
+    frame = pd.DataFrame({'Status': ['NSE market closed — live Dhan requests are disabled.']})
 else:
- with st.spinner('Loading NIFTY 500 quotes in one shared batch...'): frame=engine.stock_scan()
-if engine.last_error: st.error(f'Data diagnostic: {engine.last_error}')
-source='Market closed' if not market_open() else ('Dhan' if engine.last_successful_quote else 'Unavailable')
+    with st.spinner('Loading NIFTY 500 quotes in one shared batch...'):
+        frame = engine.stock_scan()
+
+if engine.last_error:
+    st.error(f'Data diagnostic: {engine.last_error}')
+
+source = 'Market closed' if not market_open() else ('Dhan' if engine.last_successful_quote else 'Unavailable')
+
 st.subheader('NIFTY 500 index')
 st.info('Index data unavailable — no second Dhan request is made. The scanner uses the single shared equity quote response.')
-cols=st.columns(4); cols[0].metric('Index LTP','Index data unavailable'); cols[1].metric('Source',source); cols[2].metric('Last successful quote',engine.last_successful_quote.strftime('%Y-%m-%d %H:%M:%S IST') if engine.last_successful_quote else 'None'); cols[3].metric('Trading allowed','YES' if engine.can_trade() else 'NO')
+cols = st.columns(4)
+cols[0].metric('Index LTP', 'Index data unavailable')
+cols[1].metric('Source', source)
+cols[2].metric(
+    'Last successful quote',
+    engine.last_successful_quote.strftime('%Y-%m-%d %H:%M:%S IST') if engine.last_successful_quote else 'None',
+)
+cols[3].metric('Trading allowed', 'YES' if engine.can_trade() else 'NO')
+
 st.subheader('NIFTY 500 scanner')
-if frame.empty or 'LTP' not in frame.columns: st.warning('No stock quotes available. Check Dhan access, market hours, or cooldown diagnostic.')
+if frame.empty or 'LTP' not in frame.columns:
+    st.warning('No stock quotes available. Check Dhan access, market hours, or cooldown diagnostic.')
 else:
- st.metric('Stocks with quotes',len(frame)); st.dataframe(frame,hide_index=True,use_container_width=True)
-for title,side in [('Buy setups','BUY'),('Sell setups','SELL')]:
- st.subheader(title); st.dataframe(engine.setup_table(side),hide_index=True,use_container_width=True)
-st.subheader("Today's positions"); st.dataframe(engine.today_positions(),hide_index=True,use_container_width=True)
-st.subheader('Past positions'); st.dataframe(engine.past_positions(),hide_index=True,use_container_width=True)
-with st.expander('📘 Strategy'): st.markdown(engine.strategy_markdown())
-with st.expander('⚙️ Configuration'): st.dataframe(engine.config_table(),hide_index=True,use_container_width=True)
+    st.metric('Stocks with quotes', len(frame))
+    st.dataframe(frame, hide_index=True, use_container_width=True)
+
+for title, side in [('Buy setups', 'BUY'), ('Sell setups', 'SELL')]:
+    st.subheader(title)
+    st.dataframe(engine.setup_table(side), hide_index=True, use_container_width=True)
+
+st.subheader("Today's positions")
+st.dataframe(engine.today_positions(), hide_index=True, use_container_width=True)
+st.subheader('Past positions')
+st.dataframe(engine.past_positions(), hide_index=True, use_container_width=True)
+
+with st.expander('📘 Strategy'):
+    st.markdown(engine.strategy_markdown())
+with st.expander('⚙️ Configuration'):
+    st.dataframe(engine.config_table(), hide_index=True, use_container_width=True)
+
 st.caption(f"Dashboard time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} IST")
