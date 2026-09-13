@@ -31,7 +31,7 @@ class DhanClient:
     def post(self, path, payload):
         if not self.ready:
             raise RuntimeError("Dhan Client ID and Access Token are required.")
-        r = self.session.post(f"{API}{path}", json=payload, timeout=20)
+        r = self.session.post(f"{API}{path}", json=payload, timeout=15)
         try:
             data = r.json()
         except Exception:
@@ -46,7 +46,7 @@ class DhanClient:
 
 @lru_cache(maxsize=1)
 def _cached_universe():
-    r = requests.get(NIFTY500_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(NIFTY500_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     f = pd.read_csv(io.BytesIO(r.content))
     cols = {re.sub(r"[^A-Z0-9]", "", str(c).upper()): c for c in f.columns}
@@ -57,26 +57,43 @@ def _cached_universe():
 
 @lru_cache(maxsize=1)
 def _cached_master():
-    r = requests.get(DHAN_MASTER_URL, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(DHAN_MASTER_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
-    f = pd.read_csv(io.BytesIO(r.content), low_memory=False)
+    f = pd.read_csv(io.BytesIO(r.content), low_memory=False, on_bad_lines="skip")
     original = list(f.columns)
     normalized = {re.sub(r"[^A-Z0-9]", "", str(c).upper()): c for c in f.columns}
 
-    def choose(*names):
+    def choose_exact(*names):
         for name in names:
-            for key, original_name in normalized.items():
-                if name in key:
+            key = re.sub(r"[^A-Z0-9]", "", name.upper())
+            if key in normalized:
+                return normalized[key]
+        return None
+
+    def choose_contains(*names):
+        for name in names:
+            key = re.sub(r"[^A-Z0-9]", "", name.upper())
+            for actual, original_name in normalized.items():
+                if key in actual:
                     return original_name
         return None
 
-    sid = choose("SEMSECURITYID", "SECURITYID")
-    sym = choose("SEMTRADINGSYMBOL", "TRADINGSYMBOL", "CUSTOMSYMBOL", "SYMBOLNAME", "SYMBOL")
-    exch = choose("SEMEXCHID", "EXCHID", "EXCHANGEID", "EXCHANGE")
+    # Dhan has used both old and current master headers, including:
+    # SEM_SMST_SECURITY_ID, SEM_TRADING_SYMBOL and SEM_EXM_EXCH_ID.
+    sid = choose_exact(
+        "SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID", "SECURITYID"
+    ) or choose_contains("SMSTSECURITYID", "SECURITYID")
+    sym = choose_exact(
+        "SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "TRADING_SYMBOL", "TRADINGSYMBOL"
+    ) or choose_contains("TRADINGSYMBOL", "CUSTOMSYMBOL", "SYMBOLNAME")
+    exch = choose_exact(
+        "SEM_EXM_EXCH_ID", "SEM_EXCH_ID", "EXCHANGE_ID", "EXCHID"
+    ) or choose_contains("EXMEXCHID", "EXCHID", "EXCHANGE")
     if not sid or not sym:
-        raise RuntimeError(f"Dhan master schema not recognized: {original[:20]}")
+        raise RuntimeError(f"Dhan master schema not recognized: {original[:30]}")
+
     if exch:
-        f = f[f[exch].astype(str).str.upper().str.contains("NSE", na=False)]
+        f = f[f[exch].astype(str).str.upper().isin(["NSE", "NSE_EQ", "NSECM", "NSE CM"])]
 
     master = {}
     for _, row in f.iterrows():
