@@ -34,11 +34,6 @@ def get_engine(cid, token, risk, max_loss, rr):
 engine = get_engine(client_id, access_token, per_trade_risk, max_day_loss, target_rr)
 
 st.subheader("NIFTY 500 market overview")
-metric_cols = st.columns(4)
-labels = ["NIFTY 500 index LTP", "NIFTY 500 index PDC", "NIFTY 500 today % vs PDC", "Daily P&L"]
-for col, label in zip(metric_cols, labels):
-    col.metric(label, "—")
-
 all_stocks = engine.stock_scan()
 index = engine.index_metrics() or {}
 
@@ -46,14 +41,16 @@ ltp = index.get("LTP")
 pdc = index.get("PDC")
 change = ((ltp - pdc) / pdc * 100) if ltp is not None and pdc else None
 values = [ltp, pdc, change, engine.daily_pnl()]
-for col, value, kind in zip(metric_cols, values, ["price", "price", "change", "price"]):
+metric_cols = st.columns(4)
+labels = ["NIFTY 500 index LTP", "NIFTY 500 index PDC", "NIFTY 500 today % vs PDC", "Daily P&L"]
+for col, label, value, kind in zip(metric_cols, labels, values, ["price", "price", "change", "price"]):
     if value is None:
         display = "—"
     elif kind == "change":
         display = f"{value:+.2f}%"
     else:
         display = f"{value:,.2f}"
-    col.metric("", display)
+    col.metric(label, display)
 
 st.subheader("NIFTY 500 alignment scanner")
 st.caption("NIFTY 500 constituents • Dhan live LTP • quote/session date • one scan per 15-second refresh")
@@ -80,7 +77,7 @@ with st.expander("📘 Complete strategy", expanded=False):
 with st.expander("⚙️ Symbol / security configuration", expanded=False):
     st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
 if engine.last_error:
-    st.info(engine.last_error)
+    st.error(f"Live data diagnostic: {engine.last_error}")
 else:
     st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
 st.caption(f"Dashboard time: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} IST")
