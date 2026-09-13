@@ -2,6 +2,8 @@ import streamlit as st
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
+from io import StringIO
+import csv
 from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine
 
@@ -10,41 +12,72 @@ refresh_count = st_autorefresh(interval=15_000, key='orb_live_refresh')
 st.title('📈 ORB Strategy Dashboard')
 st.caption('Dhan market data • NIFTY 500 • Paper trading only • 15-second refresh')
 
+
+def find_nifty500_security_id(headers):
+    """Find the exact Dhan IDX_I security ID; never guess 13/28."""
+    urls = [
+        'https://images.dhan.co/api-data/api-scrip-master.csv',
+        'https://images.dhan.co/api-data/api-scrip-master-detailed.csv',
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=(5, 20))
+            r.raise_for_status()
+            text = r.text
+            reader = csv.DictReader(StringIO(text))
+            for row in reader:
+                normalized = ' '.join(str(v or '').upper().replace('_', ' ') for v in row.values())
+                segment = ' '.join(str(row.get(k, '') or '').upper() for k in ('EXCH_ID', 'EXCHANGE', 'SEGMENT', 'EXCH_SEG'))
+                if 'IDX_I' not in segment and 'INDEX' not in segment:
+                    continue
+                if 'NIFTY 500' not in normalized and 'NIFTY500' not in normalized:
+                    continue
+                for key, value in row.items():
+                    if key.upper() in ('SECURITY_ID', 'SECURITYID', 'SEM_SMST_SECURITY_ID') and str(value).strip().isdigit():
+                        return int(str(value).strip()), None
+        except Exception:
+            continue
+    return None, 'Could not find exact NIFTY 500 security ID in Dhan instrument master'
+
+
 def fetch_nifty500_index(client_id, token):
     if not client_id or not token:
         return None, 'Missing Dhan credentials'
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'access-token': token,
+        'client-id': client_id,
+    }
     try:
-        headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'access-token': token,
-            'client-id': client_id,
-        }
-        for sid in (28, 13):
-            r = requests.post(
-                'https://api.dhan.co/v2/marketfeed/ohlc',
-                headers=headers,
-                json={'IDX_I': [sid]},
-                timeout=(5, 15),
-            )
-            r.raise_for_status()
-            data = r.json()
-            bucket = (data.get('data') or {}).get('IDX_I') or {}
-            item = bucket.get(str(sid)) or bucket.get(sid) or {}
-            ltp = item.get('last_price') or item.get('ltp')
-            o = item.get('ohlc') or {}
-            if ltp is not None:
-                return {
-                    'ltp': float(ltp),
-                    'open': o.get('open'),
-                    'high': o.get('high'),
-                    'low': o.get('low'),
-                    'close': o.get('close'),
-                    'security_id': sid,
-                }, None
-        return None, 'Dhan returned no IDX_I quote for NIFTY 500'
+        sid, sid_error = find_nifty500_security_id(headers)
+        if sid is None:
+            return None, sid_error
+        r = requests.post(
+            'https://api.dhan.co/v2/marketfeed/ohlc',
+            headers=headers,
+            json={'IDX_I': [sid]},
+            timeout=(5, 15),
+        )
+        r.raise_for_status()
+        data = r.json()
+        bucket = (data.get('data') or {}).get('IDX_I') or {}
+        item = bucket.get(str(sid)) or bucket.get(sid) or {}
+        ltp = item.get('last_price') or item.get('ltp')
+        o = item.get('ohlc') or {}
+        if ltp is None:
+            return None, f'Dhan returned no quote for exact NIFTY 500 security ID {sid}'
+        return {
+            'ltp': float(ltp),
+            'open': o.get('open'),
+            'high': o.get('high'),
+            'low': o.get('low'),
+            'close': o.get('close'),
+            'security_id': sid,
+        }, None
     except Exception as e:
         return None, f'{type(e).__name__}: {e}'
+
 
 with st.sidebar:
     st.header('Dhan connection')
@@ -63,9 +96,11 @@ with st.sidebar:
     st.caption('Live order placement is disabled in code.')
     st.caption(f'Refresh #{refresh_count} • every 15 seconds')
 
+
 @st.cache_resource(show_spinner=False)
 def get_engine(cid, tok, r, loss, target):
     return ORBEngine(cid, tok, r, loss, target)
+
 
 engine = get_engine(client_id, token, risk, max_loss, rr)
 frame = engine.stock_scan()
@@ -80,6 +115,7 @@ if index_data:
     b.metric('Index Open', f"₹{float(index_data['open']):,.2f}" if index_data['open'] is not None else '—')
     c.metric('Index High', f"₹{float(index_data['high']):,.2f}" if index_data['high'] is not None else '—')
     d.metric('Index Low', f"₹{float(index_data['low']):,.2f}" if index_data['low'] is not None else '—')
+    st.caption(f"Exact Dhan NIFTY 500 security ID: {index_data['security_id']}")
 else:
     st.warning(f'NIFTY 500 index price unavailable: {index_error}')
 
