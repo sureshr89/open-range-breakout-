@@ -10,30 +10,43 @@ from engine import ORBEngine
 st.set_page_config(page_title='ORB Strategy Dashboard', page_icon='📈', layout='wide')
 refresh_count = st_autorefresh(interval=15_000, key='orb_live_refresh')
 st.title('📈 ORB Strategy Dashboard')
-st.caption('Dhan market data • NIFTY 500 • Paper trading only • 15-second refresh')
+st.caption('Dhan market data • NSE NIFTY 500 • Paper trading only • 15-second refresh')
 
 
 def find_nifty500_security_id(headers):
-    """Find the exact Dhan IDX_I security ID; never guess 13/28."""
+    """Resolve the real Dhan IDX_I ID for the NSE NIFTY 500 index. Never guess IDs."""
     urls = [
-        'https://images.dhan.co/api-data/api-scrip-master.csv',
         'https://images.dhan.co/api-data/api-scrip-master-detailed.csv',
+        'https://images.dhan.co/api-data/api-scrip-master.csv',
     ]
+    id_keys = {'SECURITY_ID', 'SECURITYID', 'SEM_SMST_SECURITY_ID', 'SEM_SECURITY_ID'}
+    name_keys = {
+        'SEM_CUSTOM_SYMBOL', 'CUSTOM_SYMBOL', 'SYMBOL_NAME', 'SYMBOL',
+        'DISPLAY_NAME', 'UNDERLYING_SYMBOL', 'INSTRUMENT_NAME',
+        'SEM_TRADING_SYMBOL', 'TRADING_SYMBOL'
+    }
+    segment_keys = {'EXCH_ID', 'EXCHANGE', 'SEGMENT', 'EXCH_SEG', 'SEM_SEGMENT', 'SEM_EXM_EXCH_ID'}
+
     for url in urls:
         try:
-            r = requests.get(url, timeout=(5, 20))
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(8, 60))
             r.raise_for_status()
-            text = r.text
-            reader = csv.DictReader(StringIO(text))
+            reader = csv.DictReader(StringIO(r.text))
             for row in reader:
-                normalized = ' '.join(str(v or '').upper().replace('_', ' ') for v in row.values())
-                segment = ' '.join(str(row.get(k, '') or '').upper() for k in ('EXCH_ID', 'EXCHANGE', 'SEGMENT', 'EXCH_SEG'))
-                if 'IDX_I' not in segment and 'INDEX' not in segment:
-                    continue
-                if 'NIFTY 500' not in normalized and 'NIFTY500' not in normalized:
+                clean = lambda value: ''.join(ch for ch in str(value or '').upper() if ch.isalnum())
+                normalized_values = [clean(v) for v in row.values()]
+                normalized_names = [clean(row.get(k, '')) for k in name_keys]
+                normalized_segments = [clean(row.get(k, '')) for k in segment_keys]
+                is_nifty500 = any(v in {'NIFTY500', 'NIFTY500INDEX'} for v in normalized_names)
+                if not is_nifty500:
+                    is_nifty500 = 'NIFTY500' in ' '.join(normalized_values)
+                is_index = not normalized_segments or any(
+                    v in {'IDXI', 'INDEX', 'NSEINDEX', 'NSE'} for v in normalized_segments
+                )
+                if not (is_nifty500 and is_index):
                     continue
                 for key, value in row.items():
-                    if key.upper() in ('SECURITY_ID', 'SECURITYID', 'SEM_SMST_SECURITY_ID') and str(value).strip().isdigit():
+                    if key.upper() in id_keys and str(value).strip().isdigit():
                         return int(str(value).strip()), None
         except Exception:
             continue
@@ -57,7 +70,7 @@ def fetch_nifty500_index(client_id, token):
             'https://api.dhan.co/v2/marketfeed/ohlc',
             headers=headers,
             json={'IDX_I': [sid]},
-            timeout=(5, 15),
+            timeout=(8, 20),
         )
         r.raise_for_status()
         data = r.json()
@@ -65,8 +78,8 @@ def fetch_nifty500_index(client_id, token):
         item = bucket.get(str(sid)) or bucket.get(sid) or {}
         ltp = item.get('last_price') or item.get('ltp')
         o = item.get('ohlc') or {}
-        if ltp is None:
-            return None, f'Dhan returned no quote for exact NIFTY 500 security ID {sid}'
+        if ltp is None or float(ltp) <= 0:
+            return None, f'Dhan returned no valid quote for exact NIFTY 500 security ID {sid}'
         return {
             'ltp': float(ltp),
             'open': o.get('open'),
@@ -103,8 +116,16 @@ def get_engine(cid, tok, r, loss, target):
 
 
 engine = get_engine(client_id, token, risk, max_loss, rr)
-frame = engine.stock_scan()
+
+# Mandatory market-condition gate: resolve and validate NIFTY 500 BEFORE scanning stocks.
 index_data, index_error = fetch_nifty500_index(client_id, token)
+if not index_data:
+    st.error('🚫 TRADING BLOCKED — NIFTY 500 index price unavailable')
+    st.warning(index_error or 'NIFTY 500 quote unavailable')
+    st.info('No BUY, SELL, signal generation, or paper trade is allowed until NIFTY 500 is available.')
+    st.stop()
+
+frame = engine.stock_scan()
 
 if engine.last_error:
     st.error(f'Data diagnostic: {engine.last_error}')
@@ -115,9 +136,7 @@ if index_data:
     b.metric('Index Open', f"₹{float(index_data['open']):,.2f}" if index_data['open'] is not None else '—')
     c.metric('Index High', f"₹{float(index_data['high']):,.2f}" if index_data['high'] is not None else '—')
     d.metric('Index Low', f"₹{float(index_data['low']):,.2f}" if index_data['low'] is not None else '—')
-    st.caption(f"Exact Dhan NIFTY 500 security ID: {index_data['security_id']}")
-else:
-    st.warning(f'NIFTY 500 index price unavailable: {index_error}')
+    st.caption(f"NSE NIFTY 500 • Exact Dhan IDX_I security ID: {index_data['security_id']}")
 
 if frame.empty or 'LTP' not in frame.columns:
     st.warning('No market quotes available. Check Dhan Data API subscription, token, and market hours.')
