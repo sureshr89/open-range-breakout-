@@ -36,6 +36,18 @@ def get_engine(cid, tok, r, loss, target):
     return ORBEngine(cid, tok, r, loss, target)
 
 
+def format_quote_time(value):
+    """Render quote timestamps safely regardless of engine timestamp type."""
+    if value is None:
+        return 'None'
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=IST)
+        return value.astimezone(IST).strftime('%Y-%m-%d %H:%M:%S IST')
+    text = str(value).strip()
+    return text or 'None'
+
+
 engine = get_engine(client_id, token, risk, max_loss, rr)
 
 if not market_open():
@@ -45,20 +57,19 @@ else:
     with st.spinner('Loading NIFTY 500 quotes in one shared batch...'):
         frame = engine.stock_scan()
 
-if engine.last_error:
-    st.error(f'Data diagnostic: {engine.last_error}')
+last_error = getattr(engine, 'last_error', None)
+if last_error:
+    st.error(f'Data diagnostic: {last_error}')
 
-source = 'Market closed' if not market_open() else ('Dhan' if engine.last_successful_quote else 'Unavailable')
+last_successful_quote = getattr(engine, 'last_successful_quote', None)
+source = 'Market closed' if not market_open() else ('Dhan' if last_successful_quote else 'Unavailable')
 
 st.subheader('NIFTY 500 index')
 st.info('Index data unavailable — no second Dhan request is made. The scanner uses the single shared equity quote response.')
 cols = st.columns(4)
 cols[0].metric('Index LTP', 'Index data unavailable')
 cols[1].metric('Source', source)
-cols[2].metric(
-    'Last successful quote',
-    engine.last_successful_quote.strftime('%Y-%m-%d %H:%M:%S IST') if engine.last_successful_quote else 'None',
-)
+cols[2].metric('Last successful quote', format_quote_time(last_successful_quote))
 cols[3].metric('Trading allowed', 'YES' if engine.can_trade() else 'NO')
 
 st.subheader('NIFTY 500 scanner')
