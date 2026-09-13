@@ -11,8 +11,8 @@ st.caption("Dhan market-data driven • Paper-trading logic • Auto-refresh eve
 
 with st.sidebar:
     st.header("Dhan connection")
-    client_id = st.secrets.get("DHAN_CLIENT_ID", "").strip()
-    access_token = st.secrets.get("DHAN_ACCESS_TOKEN", "").strip()
+    client_id = str(st.secrets.get("DHAN_CLIENT_ID", "") or "").strip()
+    access_token = str(st.secrets.get("DHAN_ACCESS_TOKEN", "") or "").strip()
     if client_id and access_token:
         st.success("Dhan secrets loaded")
     else:
@@ -27,24 +27,21 @@ with st.sidebar:
     st.caption("No order-placement API is enabled. This dashboard is paper-trading only.")
     st.caption(f"Refresh #{refresh_count} • every 15 seconds")
 
-engine = ORBEngine(
-    client_id=client_id,
-    access_token=access_token,
-    risk_per_trade=per_trade_risk,
-    max_daily_loss=max_day_loss,
-    target_rr=target_rr,
-)
+engine = ORBEngine(client_id, access_token, per_trade_risk, max_day_loss, target_rr)
 
-# Exactly one stock-scan call per 15-second refresh. The engine cache is reused
-# by the setup tables, so they do not trigger additional pulls in this cycle.
-all_stocks = engine.stock_scan()
+# Always render the dashboard, even if a remote NSE/Dhan request fails.
+# The engine itself caches the scan during this Streamlit run.
+try:
+    all_stocks = engine.stock_scan()
+except Exception as exc:
+    all_stocks = __import__("pandas").DataFrame()
+    engine.last_error = f"Scanner error: {type(exc).__name__}: {exc}"
 
-# Dashboard headline values are calculated from the NIFTY 500 constituent basket,
-# not from the NIFTY 50 index. Dhan remains the source of the stock prices.
+
 def mean_value(column):
     if all_stocks.empty or column not in all_stocks.columns:
         return None
-    values = all_stocks[column].dropna()
+    values = __import__("pandas").to_numeric(all_stocks[column], errors="coerce").dropna()
     return float(values.mean()) if not values.empty else None
 
 basket_ltp = mean_value("LTP")
@@ -58,13 +55,16 @@ metrics = [
     ("NIFTY 500 today % vs PDC", basket_change_pct, "%"),
     ("Daily P&L", engine.daily_pnl(), None),
 ]
-for c, (label, value, suffix) in zip(cols, metrics):
+for col, (label, value, suffix) in zip(cols, metrics):
     display = "—" if value is None else (f"{value:+.2f}%" if suffix == "%" else f"{value:,.2f}")
-    c.metric(label, display)
+    col.metric(label, display)
 
 st.subheader("NIFTY 500 alignment scanner")
-st.caption("NIFTY 500 constituents with Dhan LTP, open, PDC, today/1W/1M/3M alignment, ORB high/low, and buy condition.")
-st.dataframe(all_stocks, use_container_width=True, hide_index=True)
+st.caption("NIFTY 500 constituents • Dhan live LTP • one scan per 15-second refresh")
+if all_stocks.empty:
+    st.info("Waiting for NIFTY 500 data…")
+else:
+    st.dataframe(all_stocks, use_container_width=True, hide_index=True)
 
 st.subheader("Buy setups")
 st.dataframe(engine.setup_table("BUY"), use_container_width=True, hide_index=True)
