@@ -1,5 +1,6 @@
 import streamlit as st
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine
 
@@ -82,4 +83,4 @@ if engine.last_error:
     st.info(engine.last_error)
 else:
     st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
-st.caption(f"Dashboard time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
+st.caption(f"Dashboard time: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} IST")
