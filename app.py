@@ -12,7 +12,10 @@ with st.sidebar:
     st.header("Dhan connection")
     client_id = str(st.secrets.get("DHAN_CLIENT_ID", "") or "").strip()
     access_token = str(st.secrets.get("DHAN_ACCESS_TOKEN", "") or "").strip()
-    st.success("Dhan secrets loaded") if client_id and access_token else st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN")
+    if client_id and access_token:
+        st.success("Dhan secrets loaded")
+    else:
+        st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN")
     st.divider()
     st.subheader("Risk controls")
     per_trade_risk = st.number_input("Risk / trade (₹)", min_value=2000, max_value=2500, value=2250, step=50)
@@ -23,23 +26,38 @@ with st.sidebar:
     st.caption("No order-placement API is enabled. This dashboard is paper-trading only.")
     st.caption(f"Refresh #{refresh_count} • every 15 seconds")
 
-engine = ORBEngine(client_id, access_token, per_trade_risk, max_day_loss, target_rr)
-try:
-    all_stocks = engine.stock_scan()
-except Exception as exc:
-    all_stocks = __import__("pandas").DataFrame()
-    engine.last_error = f"Scanner error: {type(exc).__name__}: {exc}"
+@st.cache_resource(show_spinner=False)
+def get_engine(cid, token, risk, max_loss, rr):
+    return ORBEngine(cid, token, risk, max_loss, rr)
 
-index = engine.index_metrics() or {}
+engine = get_engine(client_id, access_token, per_trade_risk, max_day_loss, target_rr)
+
+st.subheader("NIFTY 500 market overview")
+metric_cols = st.columns(4)
+for col, label in zip(metric_cols, ["NIFTY 500 index LTP", "NIFTY 500 index PDC", "NIFTY 500 today % vs PDC", "Daily P&L"]):
+    col.metric(label, "Loading…")
+
+try:
+    with st.spinner("Loading one Dhan batch for NIFTY 500…"):
+        all_stocks = engine.stock_scan()
+        index = engine.index_metrics() or {}
+except Exception as exc:
+    import pandas as pd
+    all_stocks = pd.DataFrame()
+    index = {}
+    engine.last_error = f"NIFTY 500 scan error: {type(exc).__name__}: {exc}"
+
 ltp = index.get("LTP")
 pdc = index.get("PDC")
 change = ((ltp - pdc) / pdc * 100) if ltp is not None and pdc else None
-
-cols = st.columns(4)
-metrics = [("NIFTY 500 index LTP", ltp, None), ("NIFTY 500 index PDC", pdc, None), ("NIFTY 500 today % vs PDC", change, "%"), ("Daily P&L", engine.daily_pnl(), None)]
-for col, (label, value, suffix) in zip(cols, metrics):
-    display = "—" if value is None else (f"{value:+.2f}%" if suffix == "%" else f"{value:,.2f}")
-    col.metric(label, display)
+for col, value, kind in zip(metric_cols, [ltp, pdc, change, engine.daily_pnl()], ["price", "price", "change", "price"]):
+    if value is None:
+        display = "—"
+    elif kind == "change":
+        display = f"{value:+.2f}%"
+    else:
+        display = f"{value:,.2f}"
+    col.metric("", display)
 
 st.subheader("NIFTY 500 alignment scanner")
 st.caption("NIFTY 500 constituents • Dhan live LTP • one scan per 15-second refresh")
@@ -57,8 +75,12 @@ st.dataframe(engine.today_positions(), use_container_width=True, hide_index=True
 st.subheader("Past position details")
 st.dataframe(engine.past_positions(), use_container_width=True, hide_index=True)
 
-with st.expander("📘 Complete strategy", expanded=False): st.markdown(engine.strategy_markdown())
-with st.expander("⚙️ Symbol / security configuration", expanded=False): st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
-if engine.last_error: st.warning(engine.last_error)
-else: st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
+with st.expander("📘 Complete strategy", expanded=False):
+    st.markdown(engine.strategy_markdown())
+with st.expander("⚙️ Symbol / security configuration", expanded=False):
+    st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
+if engine.last_error:
+    st.warning(engine.last_error)
+else:
+    st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
 st.caption(f"Dashboard time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
