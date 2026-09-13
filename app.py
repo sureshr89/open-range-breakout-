@@ -1,6 +1,5 @@
 import streamlit as st
 from datetime import datetime
-import time as time_module
 from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine
 
@@ -14,8 +13,10 @@ with st.sidebar:
     st.header("Dhan connection")
     client_id = st.secrets.get("DHAN_CLIENT_ID", "").strip()
     access_token = st.secrets.get("DHAN_ACCESS_TOKEN", "").strip()
-    if client_id and access_token: st.success("Dhan secrets loaded")
-    else: st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in Streamlit Secrets")
+    if client_id and access_token:
+        st.success("Dhan secrets loaded")
+    else:
+        st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in Streamlit Secrets")
     st.divider()
     st.subheader("Risk controls")
     per_trade_risk = st.number_input("Risk / trade (₹)", min_value=2000, max_value=2500, value=2250, step=50)
@@ -26,35 +27,43 @@ with st.sidebar:
     st.caption("No order-placement API is enabled. This dashboard is paper-trading only.")
     st.caption(f"Refresh #{refresh_count} • every 15 seconds")
 
-engine = ORBEngine(client_id=client_id, access_token=access_token, risk_per_trade=per_trade_risk,
-                   max_daily_loss=max_day_loss, target_rr=target_rr)
+engine = ORBEngine(
+    client_id=client_id,
+    access_token=access_token,
+    risk_per_trade=per_trade_risk,
+    max_daily_loss=max_day_loss,
+    target_rr=target_rr,
+)
 
-# Cache each distinct Dhan LTP request for one refresh cycle.
-_original_ltp = engine.dhan.ltp
-_ltp_cache = {}
-_ltp_cache_ttl = 15.0
+# Exactly one stock-scan call per 15-second refresh. The engine cache is reused
+# by the setup tables, so they do not trigger additional pulls in this cycle.
+all_stocks = engine.stock_scan()
 
-def cached_ltp(securities):
-    key = repr(sorted((str(k), tuple(sorted(map(int, v)))) for k, v in securities.items()))
-    now = time_module.monotonic()
-    cached = _ltp_cache.get(key)
-    if cached and now - cached[0] < _ltp_cache_ttl: return cached[1]
-    response = _original_ltp(securities)
-    _ltp_cache[key] = (now, response)
-    return response
+# Dashboard headline values are calculated from the NIFTY 500 constituent basket,
+# not from the NIFTY 50 index. Dhan remains the source of the stock prices.
+def mean_value(column):
+    if all_stocks.empty or column not in all_stocks.columns:
+        return None
+    values = all_stocks[column].dropna()
+    return float(values.mean()) if not values.empty else None
 
-engine.dhan.ltp = cached_ltp
-status = engine.snapshot()
+basket_ltp = mean_value("LTP")
+basket_pdc = mean_value("PDC")
+basket_change_pct = mean_value("Today %")
 
 cols = st.columns(4)
-metrics = [("NIFTY market LTP", status.get("nifty500_ltp"), None), ("Previous-day close", status.get("pdc"), None), ("Today % vs PDC", status.get("nifty500_change_pct"), "%"), ("Daily P&L", status.get("daily_pnl"), None)]
+metrics = [
+    ("NIFTY 500 basket LTP", basket_ltp, None),
+    ("NIFTY 500 average PDC", basket_pdc, None),
+    ("NIFTY 500 today % vs PDC", basket_change_pct, "%"),
+    ("Daily P&L", engine.daily_pnl(), None),
+]
 for c, (label, value, suffix) in zip(cols, metrics):
     display = "—" if value is None else (f"{value:+.2f}%" if suffix == "%" else f"{value:,.2f}")
     c.metric(label, display)
 
 st.subheader("NIFTY 500 alignment scanner")
-st.caption("All available NIFTY 500 constituents with LTP, open, PDC, today/1W/1M/3M percentage alignment, ORB high/low, and buy condition.")
-all_stocks = engine.stock_scan()
+st.caption("NIFTY 500 constituents with Dhan LTP, open, PDC, today/1W/1M/3M alignment, ORB high/low, and buy condition.")
 st.dataframe(all_stocks, use_container_width=True, hide_index=True)
 
 st.subheader("Buy setups")
@@ -66,9 +75,13 @@ st.dataframe(engine.today_positions(), use_container_width=True, hide_index=True
 st.subheader("Past position details")
 st.dataframe(engine.past_positions(), use_container_width=True, hide_index=True)
 
-with st.expander("📘 Complete strategy", expanded=False): st.markdown(engine.strategy_markdown())
-with st.expander("⚙️ Symbol / security configuration", expanded=False): st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
+with st.expander("📘 Complete strategy", expanded=False):
+    st.markdown(engine.strategy_markdown())
+with st.expander("⚙️ Symbol / security configuration", expanded=False):
+    st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
 
-if status.get("warning"): st.warning(status["warning"])
-else: st.success(f"Data status: {status.get('data_status', 'OK')}")
+if engine.last_error:
+    st.warning(engine.last_error)
+else:
+    st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
 st.caption(f"Dashboard time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
