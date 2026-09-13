@@ -8,8 +8,8 @@ import pandas as pd
 
 API = "https://api.dhan.co/v2"
 
-# Dhan's IDX_I security id 390 is not a valid NIFTY 500 chart/quote id for this API.
-# Use the supported NIFTY index id 13. Keep the label accurate to avoid misleading data.
+# Dhan IDX_I security id 390 is not a valid NIFTY 500 chart/quote id for this API.
+# Use the supported NIFTY index id 13 and label it accurately.
 DEFAULT_CONFIG = {
     "NIFTY": {"security_id": "13", "exchange": "IDX_I", "instrument": "INDEX", "symbol": "NIFTY"},
 }
@@ -65,18 +65,25 @@ class ORBEngine:
         d=_to_df(self.dhan.intraday(c["security_id"],c["exchange"],c["instrument"],"1",f"{self._today} 09:15:00",f"{self._today} 09:30:00")); d=d[(d.timestamp.dt.time>=time(9,15))&(d.timestamp.dt.time<time(9,30))]
         return None if d.empty else {"high":float(d.high.max()),"low":float(d.low.min()),"start":d.timestamp.iloc[0],"end":d.timestamp.iloc[-1]}
     def snapshot(self):
-        r={"warning":None,"data_status":"Disconnected","daily_pnl":self.daily_pnl(),"pdc":None,"week_close":None,"month_close":None,"quarter_close":None,"nifty500_ltp":None,"nifty500_change":None}
+        r={"warning":None,"data_status":"Disconnected","daily_pnl":self.daily_pnl(),"pdc":None,"week_close":None,"month_close":None,"quarter_close":None,"nifty500_ltp":None,"nifty500_change":None,"nifty500_change_pct":None}
         if not self.dhan.ready: r["warning"]="Enter Dhan credentials in Streamlit Secrets."; return r
         try:
-            c=self._cfg(); r["nifty500_ltp"]=self._nifty500_ltp(); r.update(self.reference_levels(c)); r["nifty500_change"]=r["nifty500_ltp"]-r["pdc"] if r["pdc"] is not None else None; r["data_status"]="Connected to Dhan"
+            c=self._cfg(); r["nifty500_ltp"]=self._nifty500_ltp(); r.update(self.reference_levels(c));
+            if r["pdc"] is not None:
+                r["nifty500_change"]=r["nifty500_ltp"]-r["pdc"]
+                r["nifty500_change_pct"]=(r["nifty500_change"]/r["pdc"])*100 if r["pdc"] else None
+            r["data_status"]="Connected to Dhan"
         except Exception as e: r["warning"]=f"Dhan data error: {e}"; self.last_error=str(e)
         return r
     def market_table(self):
         try:
-            c=self._cfg(); l=self._nifty500_ltp(); refs=self.reference_levels(c); op=self.opening_range(c); return pd.DataFrame([{"Instrument":c["symbol"],"LTP":l,**{"PDC":refs["pdc"],"1W Close":refs["week_close"],"1M Close":refs["month_close"],"3M Close":refs["quarter_close"],"ORB High":op["high"] if op else None,"ORB Low":op["low"] if op else None}}])
-        except Exception as e: return pd.DataFrame([{"Instrument":"NIFTY","LTP":None,"PDC":None,"1W Close":None,"1M Close":None,"3M Close":None,"ORB High":None,"ORB Low":None}])
-    def setup_table(self,direction): return pd.DataFrame([{"Symbol":"NIFTY","Direction":direction,"LTP":None,"ORB High":None,"ORB Low":None,"Signal":"WAIT","Filters":"Live setup scanner not enabled"}])
+            c=self._cfg(); l=self._nifty500_ltp(); refs=self.reference_levels(c); p=refs["pdc"]; pct=((l-p)/p*100) if p else None
+            return pd.DataFrame([{"Instrument":c["symbol"],"LTP":l,"PDC":p,"Today % vs PDC":pct,"ORB High":None,"ORB Low":None}])
+        except Exception:
+            return pd.DataFrame([{"Instrument":"NIFTY","LTP":None,"PDC":None,"Today % vs PDC":None,"ORB High":None,"ORB Low":None}])
+    def setup_table(self,direction):
+        return pd.DataFrame([{"Symbol":"NIFTY","Direction":direction,"LTP":None,"ORB High":None,"ORB Low":None,"Signal":"WAIT","Filters":"Stock scanner not enabled"}])
     def today_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date"))==str(self._today)])
     def past_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date"))!=str(self._today)])
-    def strategy_markdown(self): return "**Opening range:** 09:15–09:29 IST. **Entries:** 09:30–13:00 IST. **Force exit:** 14:55 IST. Paper trading only."
+    def strategy_markdown(self): return "**Opening range:** 09:15–09:29 IST. **Entries:** 09:30–13:00 IST. **Force exit:** 14:55 IST. **NIFTY market filter:** only the current day's percentage change versus previous-day close is used (> 0 for bullish, < 0 for bearish). **Stock alignments:** the 1D/1W/1M/3M alignment rules belong to stock setups, not the NIFTY benchmark. Paper trading only."
     def config_table(self): return pd.DataFrame([{"Name":k,**v} for k,v in self.config.items()])
