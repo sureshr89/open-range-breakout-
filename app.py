@@ -1,11 +1,14 @@
-import streamlit as st
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import requests
-from io import StringIO
 import csv
+from datetime import datetime
+from io import StringIO
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
+
 from engine import ORBEngine
 
 st.set_page_config(page_title='ORB Strategy Dashboard', page_icon='📈', layout='wide')
@@ -18,170 +21,91 @@ def clean(value):
     return ''.join(ch for ch in str(value or '').upper() if ch.isalnum())
 
 
-def find_nifty500_security_id(headers):
-    """Resolve the real Dhan IDX_I ID for NSE NIFTY 500. Never guess IDs."""
+def find_nifty500_security_id():
     urls = [
         'https://images.dhan.co/api-data/api-scrip-master-detailed.csv',
         'https://images.dhan.co/api-data/api-scrip-master.csv',
     ]
     id_keys = {'SECURITY_ID', 'SECURITYID', 'SEM_SMST_SECURITY_ID', 'SEM_SECURITY_ID'}
-    name_keys = {
-        'SEM_CUSTOM_SYMBOL', 'CUSTOM_SYMBOL', 'SYMBOL_NAME', 'SYMBOL',
-        'DISPLAY_NAME', 'UNDERLYING_SYMBOL', 'INSTRUMENT_NAME',
-        'SEM_TRADING_SYMBOL', 'TRADING_SYMBOL'
-    }
-    segment_keys = {
-        'EXCH_ID', 'EXCHANGE', 'SEGMENT', 'EXCH_SEG', 'SEM_SEGMENT',
-        'SEM_EXM_EXCH_ID', 'SECURITY_TYPE', 'INSTRUMENT'
-    }
-
+    name_keys = {'SEM_CUSTOM_SYMBOL', 'CUSTOM_SYMBOL', 'SYMBOL_NAME', 'SYMBOL', 'DISPLAY_NAME', 'UNDERLYING_SYMBOL', 'INSTRUMENT_NAME', 'SEM_TRADING_SYMBOL', 'TRADING_SYMBOL'}
     for url in urls:
         try:
-            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(8, 60))
-            r.raise_for_status()
-            reader = csv.DictReader(StringIO(r.text))
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(3, 12))
+            response.raise_for_status()
+            reader = csv.DictReader(StringIO(response.text))
             for row in reader:
-                normalized_values = [clean(v) for v in row.values()]
-                normalized_names = [clean(row.get(k, '')) for k in name_keys]
-                normalized_segments = [clean(row.get(k, '')) for k in segment_keys]
-
-                is_nifty500 = any(v in {'NIFTY500', 'NIFTY500INDEX'} for v in normalized_names)
-                if not is_nifty500:
-                    is_nifty500 = any(
-                        v in {'NIFTY500', 'NIFTY500INDEX'}
-                        for v in normalized_values
-                    )
-
-                is_index = not normalized_segments or any(
-                    v in {'IDXI', 'INDEX', 'NSEINDEX', 'NSE'}
-                    for v in normalized_segments
-                )
-
-                if not (is_nifty500 and is_index):
+                names = [clean(row.get(k, '')) for k in name_keys]
+                values = [clean(v) for v in row.values()]
+                if not any(v in {'NIFTY500', 'NIFTY500INDEX'} for v in names + values):
                     continue
-
                 for key, value in row.items():
                     if clean(key) in {clean(k) for k in id_keys} and str(value).strip().isdigit():
-                        return int(str(value).strip()), None
+                        return int(str(value).strip())
         except Exception:
             continue
+    return None
 
-    return None, 'Could not find exact NIFTY 500 security ID in Dhan instrument master'
 
-
-def fetch_nifty500_from_dhan(client_id, token):
+def fetch_dhan(client_id, token):
     if not client_id or not token:
-        return None, 'Missing Dhan credentials'
-
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'access-token': token,
-        'client-id': client_id,
-    }
-
+        return None, 'Dhan credentials are missing'
     try:
-        sid, sid_error = find_nifty500_security_id(headers)
+        sid = find_nifty500_security_id()
         if sid is None:
-            return None, sid_error
-
-        r = requests.post(
-            'https://api.dhan.co/v2/marketfeed/ohlc',
-            headers=headers,
-            json={'IDX_I': [sid]},
-            timeout=(8, 20),
-        )
-        r.raise_for_status()
-        data = r.json()
-        bucket = (data.get('data') or {}).get('IDX_I') or {}
-        item = bucket.get(str(sid)) or bucket.get(sid) or {}
+            return None, 'NIFTY 500 security ID was not found in Dhan master'
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json', 'access-token': token, 'client-id': client_id}
+        response = requests.post('https://api.dhan.co/v2/marketfeed/ohlc', headers=headers, json={'IDX_I': [sid]}, timeout=(3, 8))
+        response.raise_for_status()
+        payload = response.json()
+        item = ((payload.get('data') or {}).get('IDX_I') or {}).get(str(sid)) or {}
+        ohlc = item.get('ohlc') or {}
         ltp = item.get('last_price') or item.get('ltp') or item.get('LTP')
-        o = item.get('ohlc') or {}
-
         if ltp is None or float(ltp) <= 0:
-            return None, f'Dhan returned no valid quote for exact NIFTY 500 security ID {sid}'
-
-        return {
-            'ltp': float(ltp),
-            'open': o.get('open'),
-            'high': o.get('high'),
-            'low': o.get('low'),
-            'close': o.get('close'),
-            'security_id': sid,
-            'source': 'Dhan IDX_I',
-        }, None
-    except Exception as e:
-        return None, f'{type(e).__name__}: {e}'
+            return None, f'Dhan returned no valid price for security ID {sid}'
+        return {'ltp': float(ltp), 'open': ohlc.get('open'), 'high': ohlc.get('high'), 'low': ohlc.get('low'), 'security_id': sid, 'source': 'Dhan'}, None
+    except Exception as exc:
+        return None, f'{type(exc).__name__}: {exc}'
 
 
-def fetch_nifty500_from_yfinance():
-    """Fallback feed. Yahoo Finance ticker ^CRSLDX represents NIFTY 500."""
+def fetch_yahoo():
     try:
-        ticker = yf.Ticker('^CRSLDX')
-        data = ticker.history(
-            period='5d',
-            interval='5m',
-            auto_adjust=False,
-            prepost=False,
-        )
-
+        data = yf.download('^CRSLDX', period='1d', interval='1m', auto_adjust=False, prepost=False, progress=False, threads=False, timeout=5, multi_level_index=False)
+        if data is None or data.empty:
+            data = yf.download('^CRSLDX', period='5d', interval='5m', auto_adjust=False, prepost=False, progress=False, threads=False, timeout=5, multi_level_index=False)
         if data is None or data.empty or 'Close' not in data.columns:
-            return None, 'Yahoo Finance returned no NIFTY 500 data'
-
+            return None, 'Yahoo returned no NIFTY 500 data'
         data = data.dropna(subset=['Close'])
         if data.empty:
-            return None, 'Yahoo Finance returned no valid NIFTY 500 close'
-
+            return None, 'Yahoo returned no valid NIFTY 500 close'
         last = data.iloc[-1]
         price = float(last['Close'])
-        if price <= 0:
-            return None, 'Yahoo Finance returned an invalid NIFTY 500 price'
-
-        def number(name):
-            value = last.get(name)
-            return float(value) if value is not None else None
-
-        return {
-            'ltp': price,
-            'open': number('Open'),
-            'high': number('High'),
-            'low': number('Low'),
-            'close': price,
-            'security_id': None,
-            'source': 'Yahoo Finance ^CRSLDX fallback',
-        }, None
-    except Exception as e:
-        return None, f'{type(e).__name__}: {e}'
+        return {'ltp': price, 'open': float(last['Open']) if pd.notna(last.get('Open')) else None, 'high': float(last['High']) if pd.notna(last.get('High')) else None, 'low': float(last['Low']) if pd.notna(last.get('Low')) else None, 'security_id': None, 'source': 'Yahoo ^CRSLDX'}, None
+    except Exception as exc:
+        return None, f'{type(exc).__name__}: {exc}'
 
 
-def fetch_nifty500_index(client_id, token):
-    """Dhan first, Yahoo fallback second. No valid price means no trading."""
-    dhan_data, dhan_error = fetch_nifty500_from_dhan(client_id, token)
-    if dhan_data is not None and dhan_data['ltp'] > 0:
-        return dhan_data, None
-
-    yahoo_data, yahoo_error = fetch_nifty500_from_yfinance()
-    if yahoo_data is not None and yahoo_data['ltp'] > 0:
-        return yahoo_data, f'Dhan unavailable; using Yahoo fallback. {dhan_error or ""}'.strip()
-
-    return None, f'Dhan: {dhan_error or "unavailable"} | Yahoo: {yahoo_error or "unavailable"}'
+def fetch_index(client_id, token):
+    dhan, dhan_error = fetch_dhan(client_id, token)
+    if dhan:
+        return dhan, None
+    yahoo, yahoo_error = fetch_yahoo()
+    if yahoo:
+        return yahoo, f'Dhan unavailable; Yahoo fallback active. {dhan_error}'
+    return None, f'Dhan: {dhan_error} | Yahoo: {yahoo_error}'
 
 
 with st.sidebar:
     st.header('Dhan connection')
     client_id = str(st.secrets.get('DHAN_CLIENT_ID', '') or '').strip()
     token = str(st.secrets.get('DHAN_ACCESS_TOKEN', '') or '').strip()
-    if client_id and token:
-        st.success('Dhan secrets loaded')
-    else:
-        st.error('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
+    st.success('Dhan secrets loaded') if client_id and token else st.error('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
     st.divider()
     st.subheader('Risk controls')
     risk = st.number_input('Risk / trade (₹)', min_value=1.0, max_value=100000.0, value=2250.0, step=50.0)
     max_loss = st.number_input('Max daily loss (₹)', min_value=1.0, max_value=1000000.0, value=5000.0, step=500.0)
     rr = st.number_input('Target R:R', min_value=1.0, max_value=10.0, value=2.0, step=0.5)
     st.checkbox('Paper trading', value=True, disabled=True)
-    st.caption('Live order placement is disabled in code.')
+    st.caption('Live order placement is disabled.')
     st.caption(f'Refresh #{refresh_count} • every 15 seconds')
 
 
@@ -191,36 +115,36 @@ def get_engine(cid, tok, r, loss, target):
 
 
 engine = get_engine(client_id, token, risk, max_loss, rr)
-
-# Mandatory NIFTY 500 gate before scanning or generating any trade signal.
-index_data, index_warning = fetch_nifty500_index(client_id, token)
-if not index_data:
-    st.error('🚫 TRADING BLOCKED — NIFTY 500 index price unavailable')
-    st.warning(index_warning or 'NIFTY 500 quote unavailable')
-    st.info('No BUY, SELL, signal generation, or paper trade is allowed until NIFTY 500 is available.')
-    st.stop()
+st.info('🔄 Loading NIFTY 500 index data...')
+index_data, index_warning = fetch_index(client_id, token)
 
 if index_warning:
     st.warning(index_warning)
 
-frame = engine.stock_scan()
+if index_data is None:
+    index_data = {'ltp': None, 'open': None, 'high': None, 'low': None, 'security_id': None, 'source': 'Unavailable'}
+    st.error('🚫 NIFTY 500 price unavailable — trading and signals are blocked.')
+    frame = pd.DataFrame()
+else:
+    with st.spinner('📊 Loading NIFTY 500 stock scanner...'):
+        try:
+            frame = engine.stock_scan()
+        except Exception as exc:
+            frame = pd.DataFrame()
+            st.error(f'Stock scanner failed: {type(exc).__name__}: {exc}')
 
-if engine.last_error:
+if getattr(engine, 'last_error', None):
     st.error(f'Data diagnostic: {engine.last_error}')
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric('NIFTY 500 Index', f"₹{index_data['ltp']:,.2f}")
+c1.metric('NIFTY 500 Index', f"₹{index_data['ltp']:,.2f}" if index_data['ltp'] is not None else '—')
 c2.metric('Index Open', f"₹{float(index_data['open']):,.2f}" if index_data['open'] is not None else '—')
 c3.metric('Index High', f"₹{float(index_data['high']):,.2f}" if index_data['high'] is not None else '—')
 c4.metric('Index Low', f"₹{float(index_data['low']):,.2f}" if index_data['low'] is not None else '—')
-
-if index_data['security_id'] is not None:
-    st.caption(f"NSE NIFTY 500 • Exact Dhan IDX_I security ID: {index_data['security_id']}")
-else:
-    st.caption('NSE NIFTY 500 • Price source: Yahoo Finance ^CRSLDX fallback')
+st.caption(f"NSE NIFTY 500 • Source: {index_data['source']}")
 
 if frame.empty or 'LTP' not in frame.columns:
-    st.warning('No market quotes available. Check Dhan Data API subscription, token, and market hours.')
+    st.warning('No stock quotes available. Check Dhan Data API access, token, and market hours.')
 else:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric('Stocks with quotes', len(frame))
@@ -230,21 +154,22 @@ else:
     c4.metric('Trading allowed', 'YES' if engine.can_trade() else 'NO')
 
 st.subheader('NIFTY 500 scanner')
-st.dataframe(frame, hide_index=True)
-st.subheader('Buy setups')
-st.dataframe(engine.setup_table('BUY'), hide_index=True)
-st.subheader('Sell setups')
-st.dataframe(engine.setup_table('SELL'), hide_index=True)
+st.dataframe(frame, hide_index=True, use_container_width=True)
+for title, side in [('Buy setups', 'BUY'), ('Sell setups', 'SELL')]:
+    st.subheader(title)
+    try:
+        st.dataframe(engine.setup_table(side), hide_index=True, use_container_width=True)
+    except Exception as exc:
+        st.error(f'{title} failed: {type(exc).__name__}: {exc}')
+
 st.subheader("Today's positions")
-st.dataframe(engine.today_positions(), hide_index=True)
+st.dataframe(engine.today_positions(), hide_index=True, use_container_width=True)
 st.subheader('Past positions')
-st.dataframe(engine.past_positions(), hide_index=True)
+st.dataframe(engine.past_positions(), hide_index=True, use_container_width=True)
 
 with st.expander('📘 Strategy', expanded=False):
     st.markdown(engine.strategy_markdown())
 with st.expander('⚙️ Configuration', expanded=False):
-    st.dataframe(engine.config_table(), hide_index=True)
+    st.dataframe(engine.config_table(), hide_index=True, use_container_width=True)
 
-if not engine.last_error:
-    st.success('Data source: Dhan/ Yahoo fallback • Paper mode • No live orders')
 st.caption(f"Dashboard time: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} IST")
