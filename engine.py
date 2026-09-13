@@ -1,15 +1,14 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import date, timedelta, time
+from datetime import date
 from pathlib import Path
-import io, json, time as time_module, re
+import io, json, re, time as time_module
 import requests
 import pandas as pd
 
 API = "https://api.dhan.co/v2"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-DEFAULT_CONFIG = {"NIFTY": {"security_id": "13", "exchange": "IDX_I", "instrument": "INDEX", "symbol": "NIFTY"}}
 
 @dataclass
 class RiskState:
@@ -25,126 +24,113 @@ class DhanClient:
         self.session.headers.update({"Content-Type":"application/json","Accept":"application/json","access-token":self.access_token,"client-id":self.client_id})
     @property
     def ready(self): return bool(self.client_id and self.access_token)
-    def _post(self, path, payload):
+    def post(self, path, payload):
         if not self.ready: raise RuntimeError("Dhan Client ID and Access Token are required.")
         r = self.session.post(f"{API}{path}", json=payload, timeout=30)
         try: data = r.json()
         except Exception: r.raise_for_status(); raise RuntimeError(f"Dhan returned HTTP {r.status_code}")
-        if r.status_code >= 400 or (isinstance(data,dict) and str(data.get("status","")).lower() == "failure"):
-            raise RuntimeError(f"Dhan HTTP {r.status_code}: {data.get('remarks') or data.get('message') or data.get('errorMessage') or data}")
+        if r.status_code >= 400 or str(data.get("status","")).lower() == "failure":
+            raise RuntimeError(str(data.get("remarks") or data.get("message") or data.get("errorMessage") or data))
         return data
-    def ltp(self, securities): return self._post("/marketfeed/ltp", securities)
-    def ohlc(self, securities): return self._post("/marketfeed/ohlc", securities)
-    def daily(self, security_id, exchange, instrument, from_date, to_date):
-        return self._post("/charts/historical", {"securityId":str(security_id),"exchangeSegment":exchange,"instrument":instrument,"expiryCode":0,"oi":False,"fromDate":from_date,"toDate":to_date})
-    def intraday(self, security_id, exchange, instrument, interval, from_dt, to_dt):
-        return self._post("/charts/intraday", {"securityId":str(security_id),"exchangeSegment":exchange,"instrument":instrument,"interval":interval,"oi":False,"fromDate":from_dt,"toDate":to_dt})
-
-def _to_df(data):
-    if not isinstance(data,dict) or "timestamp" not in data: return pd.DataFrame()
-    n=len(data.get("timestamp",[]))
-    f=pd.DataFrame({k:data.get(k,[None]*n) for k in ["timestamp","open","high","low","close","volume"]})
-    f["timestamp"]=pd.to_datetime(f["timestamp"],unit="s",errors="coerce")
-    return f.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    def ohlc(self, securities): return self.post("/marketfeed/ohlc", securities)
 
 class ORBEngine:
     def __init__(self, client_id, access_token, risk_per_trade=2250, max_daily_loss=5000, target_rr=2.0):
-        self.dhan=DhanClient(client_id,access_token); self.risk=RiskState(risk_per_trade,max_daily_loss,target_rr)
-        self.cache_file=Path("orb_state.json"); self.config=dict(DEFAULT_CONFIG); self.last_error=""; self._today=date.today()
-        self._load_state(); self._universe_cache=None; self._master_cache=None; self._stock_cache={}; self._scan_cache={"at":0.0,"df":None}
+        self.dhan = DhanClient(client_id, access_token)
+        self.risk = RiskState(risk_per_trade, max_daily_loss, target_rr)
+        self.cache_file = Path("orb_state.json")
+        self.last_error = ""
+        self._today = date.today()
+        self._universe_cache = None
+        self._master_cache = None
+        self._scan_cache = {"at": 0.0, "df": None}
+        self.state = self._load_state()
     def _load_state(self):
-        try: self.state=json.loads(self.cache_file.read_text()) if self.cache_file.exists() else {"positions":[]}
-        except Exception: self.state={"positions":[]}
-        self.state.setdefault("positions",[])
-    def daily_pnl(self): return float(sum(float(p.get("pnl",0)) for p in self.state["positions"] if str(p.get("date"))==str(self._today)))
-    def _cfg(self): return self.config["NIFTY"]
-    def _quote_item(self,data,segment,sid):
-        block=data.get("data",{}).get(segment,{}) if isinstance(data,dict) else {}
-        return block.get(str(sid)) or block.get(int(sid))
-    def _nifty500_ltp(self):
-        c=self._cfg(); item=self._quote_item(self.dhan.ltp({c["exchange"]:[int(c["security_id"])]}),c["exchange"],c["security_id"])
-        if not item: raise RuntimeError("Dhan returned no NIFTY quote for securityId 13")
-        return float(item["last_price"])
-    def reference_levels(self,c):
-        key=c["symbol"]; cached=self._stock_cache.get(key)
-        if cached and time_module.monotonic()-cached[0]<900: return cached[1]
-        f=_to_df(self.dhan.daily(c["security_id"],c["exchange"],c["instrument"],(self._today-timedelta(days=150)).strftime("%Y-%m-%d"),(self._today+timedelta(days=1)).strftime("%Y-%m-%d")))
-        closes=pd.to_numeric(f.get("close",pd.Series(dtype=float)),errors="coerce").dropna().reset_index(drop=True)
-        refs={"pdc":None,"week_close":None,"month_close":None,"quarter_close":None}
-        if len(closes)>=2: refs["pdc"]=float(closes.iloc[-2])
-        if len(closes)>=6: refs["week_close"]=float(closes.iloc[-6])
-        if len(closes)>=22: refs["month_close"]=float(closes.iloc[-22])
-        if len(closes)>=66: refs["quarter_close"]=float(closes.iloc[-66])
-        self._stock_cache[key]=(time_module.monotonic(),refs); return refs
-    def opening_range(self,c):
-        f=_to_df(self.dhan.intraday(c["security_id"],c["exchange"],c["instrument"],"1",f"{self._today} 09:15:00",f"{self._today} 09:30:00"))
-        if f.empty:return None
-        f=f[(f.timestamp.dt.time>=time(9,15))&(f.timestamp.dt.time<time(9,30))]
-        return None if f.empty else {"high":float(f.high.max()),"low":float(f.low.min())}
+        try: state = json.loads(self.cache_file.read_text()) if self.cache_file.exists() else {"positions":[]}
+        except Exception: state = {"positions":[]}
+        state.setdefault("positions", [])
+        return state
+    def daily_pnl(self):
+        return float(sum(float(p.get("pnl", 0)) for p in self.state["positions"] if str(p.get("date")) == str(self._today)))
     def _load_universe(self):
-        if self._universe_cache is not None:return self._universe_cache
-        r=requests.get(NIFTY500_URL,timeout=30,headers={"User-Agent":"Mozilla/5.0"}); r.raise_for_status(); f=pd.read_csv(io.BytesIO(r.content))
-        cols={re.sub(r"[^A-Z0-9]","",str(c).upper()):c for c in f.columns}; sym=cols.get("SYMBOL") or cols.get("SYMBOLNAME")
-        if not sym: raise RuntimeError(f"NIFTY 500 CSV has no Symbol column. Columns: {list(f.columns)}")
-        self._universe_cache=sorted({str(x).strip().upper() for x in f[sym].dropna() if str(x).strip()}); return self._universe_cache
+        if self._universe_cache is not None: return self._universe_cache
+        r = requests.get(NIFTY500_URL, timeout=30, headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
+        f = pd.read_csv(io.BytesIO(r.content))
+        cols = {re.sub(r"[^A-Z0-9]", "", str(c).upper()): c for c in f.columns}
+        sym_col = cols.get("SYMBOL") or cols.get("SYMBOLNAME")
+        if not sym_col: raise RuntimeError(f"NIFTY 500 list has no symbol column: {list(f.columns)[:20]}")
+        self._universe_cache = sorted({str(x).strip().upper() for x in f[sym_col].dropna() if str(x).strip()})
+        return self._universe_cache
     def _load_master(self):
-        if self._master_cache is not None:return self._master_cache
-        r=requests.get(DHAN_MASTER_URL,timeout=60,headers={"User-Agent":"Mozilla/5.0"}); r.raise_for_status(); f=pd.read_csv(io.BytesIO(r.content),low_memory=False)
-        # Normalize punctuation, spaces and casing: Dhan changes these headers periodically.
-        original=list(f.columns); f.columns=[re.sub(r"[^A-Z0-9]","_",str(c).upper()).strip("_") for c in f.columns]
-        def find(*terms):
-            for c in f.columns:
-                compact=c.replace("_","")
-                if any(t.replace("_","") in compact for t in terms): return c
+        if self._master_cache is not None: return self._master_cache
+        r = requests.get(DHAN_MASTER_URL, timeout=60, headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
+        f = pd.read_csv(io.BytesIO(r.content), low_memory=False)
+        original = list(f.columns)
+        normalized = {re.sub(r"[^A-Z0-9]", "", str(c).upper()): c for c in f.columns}
+        def choose(*names):
+            for name in names:
+                for key, original_name in normalized.items():
+                    if name in key: return original_name
             return None
-        sid=find("SECURITY_ID","SMST_SECURITY_ID","SECURITYID")
-        sym=find("TRADING_SYMBOL","CUSTOM_SYMBOL","SYMBOL_NAME","SYMBOL")
-        exch=find("EXCH_ID","EXCHANGE_ID","EXCHANGE")
+        sid = choose("SEMSECURITYID", "SECURITYID", "SECURITY_ID")
+        sym = choose("SEMTRADINGSYMBOL", "TRADINGSYMBOL", "CUSTOMSYMBOL", "SYMBOLNAME", "SYMBOL")
+        exch = choose("SEMEXCHID", "EXCHID", "EXCHANGEID", "EXCHANGE")
         if not sid or not sym:
-            self.last_error=f"Dhan master schema not recognized. Columns: {original[:30]}"; self._master_cache={}; return self._master_cache
+            self.last_error = f"Dhan master schema not recognized: {original[:20]}"
+            self._master_cache = {}
+            return self._master_cache
         if exch:
-            v=f[exch].astype(str).str.upper().str.strip(); f=f[v.str.contains("NSE",na=False)]
-        master={}
-        for _,row in f.iterrows():
-            symbol=str(row.get(sym,"")).strip().upper(); security=str(row.get(sid,"")).strip()
-            if symbol in ("","NAN","NONE") or security in ("","NAN","NONE"): continue
-            if symbol not in master: master[symbol]={"security_id":security,"exchange":"NSE_EQ","instrument":"EQUITY","symbol":symbol}
-        self._master_cache=master
-        if not master:self.last_error="Dhan master loaded but no NSE equity instruments were found."
+            f = f[f[exch].astype(str).str.upper().str.contains("NSE", na=False)]
+        master = {}
+        for _, row in f.iterrows():
+            symbol = str(row.get(sym, "")).strip().upper()
+            security = str(row.get(sid, "")).strip()
+            if symbol in ("", "NAN", "NONE") or security in ("", "NAN", "NONE"): continue
+            if symbol not in master:
+                master[symbol] = {"symbol": symbol, "security_id": security}
+        self._master_cache = master
         return master
+    @staticmethod
+    def _quote_map(data):
+        root = data.get("data", {}) if isinstance(data, dict) else {}
+        return root.get("NSE_EQ", {}) if isinstance(root, dict) else {}
     def stock_scan(self):
-        if self._scan_cache["df"] is not None and time_module.monotonic()-self._scan_cache["at"]<15:return self._scan_cache["df"]
-        try: universe,master=self._load_universe(),self._load_master(); configs=[master[s] for s in universe if s in master]
-        except Exception as e:self.last_error=str(e); return pd.DataFrame()
-        rows=[]
-        for start in range(0,len(configs),1000):
-            batch=configs[start:start+1000]
-            try: quotes=self.dhan.ohlc({"NSE_EQ":[int(c["security_id"]) for c in batch]})
-            except Exception as e:self.last_error=str(e); continue
-            for c in batch:
-                try:
-                    item=self._quote_item(quotes,"NSE_EQ",c["security_id"])
-                    if not item: continue
-                    q=item.get("ohlc") or {}; ltp=float(item.get("last_price")); op=float(q.get("open")) if q.get("open") not in (None,"",0) else None; pdc=float(q.get("close")) if q.get("close") not in (None,"",0) else None
-                    refs=self.reference_levels(c); pdc=pdc or refs.get("pdc"); orb=self.opening_range(c) or {}; orh,orl=orb.get("high"),orb.get("low")
-                    rows.append({"Symbol":c["symbol"],"LTP":ltp,"Open":op,"PDC":pdc,"Today %":((ltp-pdc)/pdc*100 if pdc else None),"1W %":((ltp-refs["week_close"])/refs["week_close"]*100 if refs.get("week_close") else None),"1M %":((ltp-refs["month_close"])/refs["month_close"]*100 if refs.get("month_close") else None),"3M %":((ltp-refs["quarter_close"])/refs["quarter_close"]*100 if refs.get("quarter_close") else None),"ORB High":orh,"ORB Low":orl,"Buy condition":"BUY" if orh is not None and ltp>orh else "WAIT"})
-                except Exception: continue
-        result=pd.DataFrame(rows); self._scan_cache={"at":time_module.monotonic(),"df":result}; return result
-    def snapshot(self):
-        out={"warning":None,"data_status":"Disconnected","daily_pnl":self.daily_pnl(),"pdc":None,"week_close":None,"month_close":None,"quarter_close":None,"nifty500_ltp":None,"nifty500_change":None,"nifty500_change_pct":None}
-        if not self.dhan.ready: out["warning"]="Enter Dhan credentials in Streamlit Secrets."; return out
+        now = time_module.monotonic()
+        if self._scan_cache["df"] is not None and now - self._scan_cache["at"] < 15:
+            return self._scan_cache["df"]
         try:
-            c=self._cfg(); out["nifty500_ltp"]=self._nifty500_ltp(); out.update(self.reference_levels(c))
-            if out["pdc"] is not None: out["nifty500_change"]=out["nifty500_ltp"]-out["pdc"]; out["nifty500_change_pct"]=out["nifty500_change"]/out["pdc"]*100
-            out["data_status"]="Connected to Dhan"
-        except Exception as e: out["warning"]=f"Dhan data error: {e}"; self.last_error=str(e)
-        return out
-    def setup_table(self,direction):
-        f=self.stock_scan()
-        if f.empty:return pd.DataFrame([{"Status":self.last_error or "No stock data returned."}])
-        return f[f["Buy condition"]=="BUY"].sort_values("Today %",ascending=False).reset_index(drop=True) if direction=="BUY" else f[f["Buy condition"]!="BUY"].sort_values("Today %",ascending=True).reset_index(drop=True)
-    def market_table(self): return pd.DataFrame()
-    def today_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date"))==str(self._today)])
-    def past_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date"))!=str(self._today)])
-    def strategy_markdown(self): return "**Universe:** NSE Nifty 500 constituent list. **Live LTP/Open/PDC:** Dhan OHLC market-feed only. **ORB:** Dhan 1-minute candles from 09:15–09:30 IST. **Buy condition:** LTP > ORB High. **Alignment:** Today %, 1W %, 1M %, 3M %. Paper trading only."
-    def config_table(self): return pd.DataFrame([{"Name":k,**v} for k,v in self.config.items()])
+            universe = self._load_universe()
+            master = self._load_master()
+            configs = [master[s] for s in universe if s in master]
+            if not configs: raise RuntimeError(self.last_error or "No NIFTY 500 NSE equity instruments matched Dhan master.")
+            # Exactly one Dhan live-data request for the whole NIFTY 500 batch.
+            payload = {"NSE_EQ": [int(c["security_id"]) for c in configs if str(c["security_id"]).isdigit()]}
+            quotes = self.dhan.ohlc(payload)
+            qmap = self._quote_map(quotes)
+            rows = []
+            for c in configs:
+                item = qmap.get(str(c["security_id"])) or qmap.get(int(c["security_id"]))
+                if not item: continue
+                o = item.get("ohlc") or {}
+                ltp = item.get("last_price")
+                if ltp in (None, ""): continue
+                op = o.get("open")
+                pdc = o.get("close")
+                rows.append({"Symbol": c["symbol"], "LTP": float(ltp), "Open": op, "PDC": pdc, "Today %": ((float(ltp)-float(pdc))/float(pdc)*100 if pdc not in (None, "", 0) else None), "1W %": None, "1M %": None, "3M %": None, "ORB High": None, "ORB Low": None, "Buy condition": "WAIT"})
+            result = pd.DataFrame(rows)
+            self.last_error = "" if not result.empty else "Dhan returned no NIFTY 500 quotes."
+        except Exception as e:
+            self.last_error = f"NIFTY 500 scan error: {e}"
+            result = pd.DataFrame([{"Status": self.last_error}])
+        self._scan_cache = {"at": now, "df": result}
+        return result
+    def setup_table(self, direction):
+        f = self.stock_scan()
+        if f.empty or "Buy condition" not in f.columns: return f
+        return f[f["Buy condition"] == "BUY"].reset_index(drop=True) if direction == "BUY" else f[f["Buy condition"] != "BUY"].reset_index(drop=True)
+    def today_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) == str(self._today)])
+    def past_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) != str(self._today)])
+    def strategy_markdown(self): return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan NSE_EQ OHLC batch per 15-second refresh. **ORB/history:** shown when a separate cached candle source is added. Paper trading only."
+    def config_table(self): return pd.DataFrame()
