@@ -15,7 +15,7 @@ import requests
 API = "https://api.dhan.co/v2"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-LIVE_TTL = 60.0
+LIVE_TTL = 15.0
 
 
 def norm(value):
@@ -34,18 +34,13 @@ class DhanClient:
         self.client_id = str(client_id or "").strip()
         self.access_token = str(access_token or "").strip()
         self.session = requests.Session()
-        self.session.headers.update({
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "access-token": self.access_token,
-            "client-id": self.client_id,
-        })
+        self.session.headers.update({"Content-Type": "application/json", "Accept": "application/json", "access-token": self.access_token, "client-id": self.client_id})
 
     def ohlc(self, payload):
         if not self.client_id or not self.access_token:
             raise RuntimeError("Dhan Client ID and Access Token are required.")
         last_error = ""
-        for attempt, wait_seconds in enumerate((0, 3, 8), start=1):
+        for wait_seconds in (0, 3, 8):
             if wait_seconds:
                 time.sleep(wait_seconds)
             response = self.session.post(f"{API}/marketfeed/ohlc", json=payload, timeout=(5, 25))
@@ -53,16 +48,12 @@ class DhanClient:
                 last_error = "Dhan rate limit 429"
                 continue
             if response.status_code >= 400:
-                body = response.text[:300].replace("\n", " ")
-                raise RuntimeError(f"Dhan HTTP {response.status_code}: {body}")
-            try:
-                data = response.json()
-            except ValueError as exc:
-                raise RuntimeError("Dhan returned invalid JSON.") from exc
+                raise RuntimeError(f"Dhan HTTP {response.status_code}: {response.text[:300].replace(chr(10), ' ')}")
+            data = response.json()
             if isinstance(data, dict) and str(data.get("status", "")).lower() in {"failure", "failed", "error"}:
                 raise RuntimeError(str(data.get("remarks") or data.get("message") or data))
             return data
-        raise RuntimeError(f"{last_error}. Dhan is throttling this token; retrying automatically on the next refresh.")
+        raise RuntimeError(f"{last_error}. Retry on the next refresh.")
 
 
 @lru_cache(maxsize=1)
@@ -91,25 +82,28 @@ def master():
         return None
 
     security_col = find("SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID", "SECURITYID")
-    symbol_col = find("SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "TRADING_SYMBOL", "TRADINGSYMBOL", "SYMBOLNAME")
+    trading_col = find("SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "TRADINGSYMBOL")
+    custom_col = find("SEM_CUSTOM_SYMBOL", "CUSTOM_SYMBOL", "SYMBOLNAME")
     segment_col = find("SEM_SEGMENT", "SEGMENT")
     exchange_col = find("SEM_EXM_EXCH_ID", "EXCHANGE_ID", "EXCHID", "EXCHANGE")
     instrument_col = find("SEM_INSTRUMENT_NAME", "INSTRUMENT_NAME", "INSTRUMENT")
-    if not security_col or not symbol_col:
+    if not security_col or not trading_col and not custom_col:
         raise RuntimeError(f"Dhan master schema not recognized: {list(frame.columns)[:30]}")
 
     equities, indices = {}, []
     for _, row in frame.iterrows():
-        symbol = str(row.get(symbol_col, "")).strip().upper()
+        trading = str(row.get(trading_col, "")).strip().upper() if trading_col else ""
+        custom = str(row.get(custom_col, "")).strip().upper() if custom_col else ""
+        symbol = trading if trading and trading not in {"NAN", "NONE"} else custom
         security_id = str(row.get(security_col, "")).strip()
         segment = str(row.get(segment_col, "")).upper() if segment_col else ""
         exchange = str(row.get(exchange_col, "")).upper() if exchange_col else ""
         instrument = str(row.get(instrument_col, "")).upper() if instrument_col else ""
-        if not symbol or symbol in {"NAN", "NONE"} or not security_id.isdigit():
+        match_text = norm(f"{trading} {custom} {segment} {exchange} {instrument}")
+        if not symbol or not security_id.isdigit():
             continue
         item = {"symbol": symbol, "security_id": security_id}
-        is_index = ("IDX" in segment or "INDEX" in segment or "IDX" in exchange
-                    or "INDEX" in instrument or "NIFTY500" in norm(symbol))
+        is_index = "IDX" in segment or "INDEX" in segment or "IDX" in exchange or "INDEX" in instrument or "NIFTY500" in match_text
         if is_index:
             indices.append(item)
         elif exchange in {"NSE", "NSE_EQ"} or not exchange_col:
@@ -141,9 +135,15 @@ class ORBEngine:
         return float(sum(float(p.get("pnl", 0)) for p in self.state["positions"] if str(p.get("date")) == str(self._today)))
 
     @staticmethod
-    def _root(data, key):
+    def _root(data, *keys):
         root = data.get("data", {}) if isinstance(data, dict) else {}
-        return root.get(key, {}) if isinstance(root, dict) else {}
+        if not isinstance(root, dict):
+            return {}
+        for key in keys:
+            value = root.get(key)
+            if isinstance(value, dict):
+                return value
+        return {}
 
     @staticmethod
     def _quote(bucket, security_id):
@@ -169,15 +169,13 @@ class ORBEngine:
             configs = [equities[s] for s in names if s in equities]
             if not configs:
                 raise RuntimeError("No NSE NIFTY 500 equities matched the Dhan instrument master.")
-
             index_candidates = [i for i in indices if "NIFTY500" in norm(i["symbol"])]
             payload = {"NSE_EQ": [int(i["security_id"]) for i in configs]}
             if index_candidates:
                 payload["IDX_I"] = [int(i["security_id"]) for i in index_candidates[:1]]
-
             data = self.dhan.ohlc(payload)
             eq = self._root(data, "NSE_EQ")
-            idx = self._root(data, "IDX_I")
+            idx = self._root(data, "IDX_I", "NSE_IDX", "IDX")
             index_value = None
             for item in index_candidates:
                 quote = self._quote(idx, item["security_id"])
@@ -185,9 +183,8 @@ class ORBEngine:
                     ltp = self._number(quote.get("last_price"))
                     close = self._number((quote.get("ohlc") or {}).get("close"))
                     if ltp is not None:
-                        index_value = {"LTP": ltp, "PDC": close}
+                        index_value = {"LTP": ltp, "PDC": close, "Today %": ((ltp - close) / close * 100) if close else None}
                         break
-
             rows = []
             for item in configs:
                 quote = self._quote(eq, item["security_id"])
@@ -198,14 +195,11 @@ class ORBEngine:
                     continue
                 ohlc = quote.get("ohlc") or {}
                 pdc = self._number(ohlc.get("close"))
-                rows.append({"Symbol": item["symbol"], "LTP": ltp, "Open": ohlc.get("open"), "PDC": pdc,
-                             "Today %": ((ltp - pdc) / pdc * 100) if pdc else None,
-                             "1W %": None, "1M %": None, "3M %": None,
-                             "ORB High": None, "ORB Low": None, "Buy condition": "WAIT"})
+                rows.append({"Symbol": item["symbol"], "LTP": ltp, "Open": ohlc.get("open"), "PDC": pdc, "Today %": ((ltp - pdc) / pdc * 100) if pdc else None, "1W %": None, "1M %": None, "3M %": None, "ORB High": None, "ORB Low": None, "Buy condition": "WAIT"})
             if not rows:
                 raise RuntimeError("Dhan returned no NSE_EQ quotes for the NIFTY 500 batch.")
+            self.last_error = "" if index_value else f"NIFTY 500 index quote not found; matched index instruments: {len(index_candidates)}. Stock data is available."
             result = pd.DataFrame(rows)
-            self.last_error = "" if index_value else "NIFTY 500 index quote not found in Dhan master; stock data is available."
             self._cache = {"at": now, "df": result, "index": index_value}
             return result
         except Exception as exc:
@@ -222,7 +216,9 @@ class ORBEngine:
         frame = self.stock_scan()
         if "Buy condition" not in frame.columns:
             return frame
-        return frame[frame["Buy condition"] == "BUY"].reset_index(drop=True) if direction == "BUY" else frame[frame["Buy condition"] != "BUY"].reset_index(drop=True)
+        if direction == "BUY":
+            return frame[frame["Buy condition"] == "BUY"].reset_index(drop=True)
+        return frame[frame["Buy condition"] == "SELL"].reset_index(drop=True)
 
     def today_positions(self):
         return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) == str(self._today)])
@@ -231,7 +227,7 @@ class ORBEngine:
         return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) != str(self._today)])
 
     def strategy_markdown(self):
-        return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan batch request per 60-second refresh. Paper trading only."
+        return "**Universe:** NSE NIFTY 500. **Live data:** Dhan batch refresh every 15 seconds. Paper trading only."
 
     def config_table(self):
         return pd.DataFrame()
