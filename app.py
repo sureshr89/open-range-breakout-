@@ -34,23 +34,18 @@ engine = get_engine(client_id, access_token, per_trade_risk, max_day_loss, targe
 
 st.subheader("NIFTY 500 market overview")
 metric_cols = st.columns(4)
-for col, label in zip(metric_cols, ["NIFTY 500 index LTP", "NIFTY 500 index PDC", "NIFTY 500 today % vs PDC", "Daily P&L"]):
-    col.metric(label, "Loading…")
+labels = ["NIFTY 500 index LTP", "NIFTY 500 index PDC", "NIFTY 500 today % vs PDC", "Daily P&L"]
+for col, label in zip(metric_cols, labels):
+    col.metric(label, "—")
 
-try:
-    with st.spinner("Loading one Dhan batch for NIFTY 500…"):
-        all_stocks = engine.stock_scan()
-        index = engine.index_metrics() or {}
-except Exception as exc:
-    import pandas as pd
-    all_stocks = pd.DataFrame()
-    index = {}
-    engine.last_error = f"NIFTY 500 scan error: {type(exc).__name__}: {exc}"
+all_stocks = engine.stock_scan()
+index = engine.index_metrics() or {}
 
 ltp = index.get("LTP")
 pdc = index.get("PDC")
 change = ((ltp - pdc) / pdc * 100) if ltp is not None and pdc else None
-for col, value, kind in zip(metric_cols, [ltp, pdc, change, engine.daily_pnl()], ["price", "price", "change", "price"]):
+values = [ltp, pdc, change, engine.daily_pnl()]
+for col, value, kind in zip(metric_cols, values, ["price", "price", "change", "price"]):
     if value is None:
         display = "—"
     elif kind == "change":
@@ -62,7 +57,7 @@ for col, value, kind in zip(metric_cols, [ltp, pdc, change, engine.daily_pnl()],
 st.subheader("NIFTY 500 alignment scanner")
 st.caption("NIFTY 500 constituents • Dhan live LTP • one scan per 15-second refresh")
 if all_stocks.empty:
-    st.info("Waiting for NIFTY 500 data…")
+    st.info("No Dhan LTP quotes returned in this scan. The next refresh will retry.")
 else:
     st.dataframe(all_stocks, use_container_width=True, hide_index=True)
 
