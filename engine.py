@@ -15,6 +15,7 @@ import requests
 API = "https://api.dhan.co/v2"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+LIVE_TTL = 60.0
 
 
 def norm(value):
@@ -43,19 +44,25 @@ class DhanClient:
     def ohlc(self, payload):
         if not self.client_id or not self.access_token:
             raise RuntimeError("Dhan Client ID and Access Token are required.")
-        response = self.session.post(f"{API}/marketfeed/ohlc", json=payload, timeout=(5, 25))
-        if response.status_code == 429:
-            raise RuntimeError("Dhan rate limit 429. The app is configured for one live batch per 15 seconds.")
-        if response.status_code >= 400:
-            body = response.text[:300].replace("\n", " ")
-            raise RuntimeError(f"Dhan HTTP {response.status_code}: {body}")
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise RuntimeError("Dhan returned invalid JSON.") from exc
-        if isinstance(data, dict) and str(data.get("status", "")).lower() in {"failure", "failed", "error"}:
-            raise RuntimeError(str(data.get("remarks") or data.get("message") or data))
-        return data
+        last_error = ""
+        for attempt, wait_seconds in enumerate((0, 3, 8), start=1):
+            if wait_seconds:
+                time.sleep(wait_seconds)
+            response = self.session.post(f"{API}/marketfeed/ohlc", json=payload, timeout=(5, 25))
+            if response.status_code == 429:
+                last_error = "Dhan rate limit 429"
+                continue
+            if response.status_code >= 400:
+                body = response.text[:300].replace("\n", " ")
+                raise RuntimeError(f"Dhan HTTP {response.status_code}: {body}")
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise RuntimeError("Dhan returned invalid JSON.") from exc
+            if isinstance(data, dict) and str(data.get("status", "")).lower() in {"failure", "failed", "error"}:
+                raise RuntimeError(str(data.get("remarks") or data.get("message") or data))
+            return data
+        raise RuntimeError(f"{last_error}. Dhan is throttling this token; retrying automatically on the next refresh.")
 
 
 @lru_cache(maxsize=1)
@@ -87,6 +94,7 @@ def master():
     symbol_col = find("SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "TRADING_SYMBOL", "TRADINGSYMBOL", "SYMBOLNAME")
     segment_col = find("SEM_SEGMENT", "SEGMENT")
     exchange_col = find("SEM_EXM_EXCH_ID", "EXCHANGE_ID", "EXCHID", "EXCHANGE")
+    instrument_col = find("SEM_INSTRUMENT_NAME", "INSTRUMENT_NAME", "INSTRUMENT")
     if not security_col or not symbol_col:
         raise RuntimeError(f"Dhan master schema not recognized: {list(frame.columns)[:30]}")
 
@@ -96,13 +104,15 @@ def master():
         security_id = str(row.get(security_col, "")).strip()
         segment = str(row.get(segment_col, "")).upper() if segment_col else ""
         exchange = str(row.get(exchange_col, "")).upper() if exchange_col else ""
+        instrument = str(row.get(instrument_col, "")).upper() if instrument_col else ""
         if not symbol or symbol in {"NAN", "NONE"} or not security_id.isdigit():
             continue
         item = {"symbol": symbol, "security_id": security_id}
-        is_index = "IDX" in segment or "INDEX" in segment or "IDX" in exchange
+        is_index = ("IDX" in segment or "INDEX" in segment or "IDX" in exchange
+                    or "INDEX" in instrument or "NIFTY500" in norm(symbol))
         if is_index:
             indices.append(item)
-        elif exchange in {"NSE", "NSE_EQ", "NSE_EQ"} or not exchange_col:
+        elif exchange in {"NSE", "NSE_EQ"} or not exchange_col:
             equities.setdefault(symbol, item)
     return equities, indices
 
@@ -141,9 +151,17 @@ class ORBEngine:
             return None
         return bucket.get(str(security_id)) or bucket.get(int(security_id))
 
+    @staticmethod
+    def _number(value):
+        try:
+            number = float(value)
+            return number if number > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     def stock_scan(self):
         now = time.monotonic()
-        if self._cache["df"] is not None and now - self._cache["at"] < 15:
+        if self._cache["df"] is not None and now - self._cache["at"] < LIVE_TTL:
             return self._cache["df"]
         try:
             names = universe()
@@ -155,29 +173,31 @@ class ORBEngine:
             index_candidates = [i for i in indices if "NIFTY500" in norm(i["symbol"])]
             payload = {"NSE_EQ": [int(i["security_id"]) for i in configs]}
             if index_candidates:
-                payload["NSE_IDX"] = [int(i["security_id"]) for i in index_candidates[:1]]
+                payload["IDX_I"] = [int(i["security_id"]) for i in index_candidates[:1]]
 
-            data = self.dhan.ohlc(payload)  # exactly one live Dhan request per refresh
+            data = self.dhan.ohlc(payload)
             eq = self._root(data, "NSE_EQ")
-            idx = self._root(data, "NSE_IDX")
+            idx = self._root(data, "IDX_I")
             index_value = None
             for item in index_candidates:
                 quote = self._quote(idx, item["security_id"])
-                if isinstance(quote, dict) and quote.get("last_price") not in (None, ""):
-                    ohlc = quote.get("ohlc") or {}
-                    close = ohlc.get("close")
-                    index_value = {"LTP": float(quote["last_price"]), "PDC": float(close) if close not in (None, "", 0) else None}
-                    break
+                if isinstance(quote, dict):
+                    ltp = self._number(quote.get("last_price"))
+                    close = self._number((quote.get("ohlc") or {}).get("close"))
+                    if ltp is not None:
+                        index_value = {"LTP": ltp, "PDC": close}
+                        break
 
             rows = []
             for item in configs:
                 quote = self._quote(eq, item["security_id"])
-                if not isinstance(quote, dict) or quote.get("last_price") in (None, ""):
+                if not isinstance(quote, dict):
+                    continue
+                ltp = self._number(quote.get("last_price"))
+                if ltp is None:
                     continue
                 ohlc = quote.get("ohlc") or {}
-                ltp = float(quote["last_price"])
-                close = ohlc.get("close")
-                pdc = float(close) if close not in (None, "", 0) else None
+                pdc = self._number(ohlc.get("close"))
                 rows.append({"Symbol": item["symbol"], "LTP": ltp, "Open": ohlc.get("open"), "PDC": pdc,
                              "Today %": ((ltp - pdc) / pdc * 100) if pdc else None,
                              "1W %": None, "1M %": None, "3M %": None,
@@ -211,7 +231,7 @@ class ORBEngine:
         return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) != str(self._today)])
 
     def strategy_markdown(self):
-        return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan batch request per 15-second refresh. Paper trading only."
+        return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan batch request per 60-second refresh. Paper trading only."
 
     def config_table(self):
         return pd.DataFrame()
