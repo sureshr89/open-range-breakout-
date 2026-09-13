@@ -63,8 +63,12 @@ else:
 
 st.subheader("Buy setups")
 st.dataframe(engine.setup_table("BUY"), use_container_width=True, hide_index=True)
-st.subheader("Sell / waiting setups")
-st.dataframe(engine.setup_table("SELL"), use_container_width=True, hide_index=True)
+st.subheader("Sell setups")
+sell_setups = engine.setup_table("SELL")
+if "Buy condition" in sell_setups.columns:
+    sell_setups = sell_setups[sell_setups["Buy condition"] == "SELL"].reset_index(drop=True)
+st.dataframe(sell_setups, use_container_width=True, hide_index=True)
+
 st.subheader("Today's position details")
 st.dataframe(engine.today_positions(), use_container_width=True, hide_index=True)
 st.subheader("Past position details")
