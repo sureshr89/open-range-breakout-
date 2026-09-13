@@ -67,8 +67,8 @@ for c, (label, value, suffix) in zip(cols, metrics):
         display = f"{value:,.2f}"
     c.metric(label, display)
 
-st.subheader("Live market data")
-st.dataframe(engine.market_table(), use_container_width=True, hide_index=True)
+# The separate Live market data table was removed intentionally.
+# The dashboard now focuses on NIFTY 500 alignment and strategy setups.
 st.subheader("Buy setups")
 st.dataframe(engine.setup_table("BUY"), use_container_width=True, hide_index=True)
 st.subheader("Sell setups")
