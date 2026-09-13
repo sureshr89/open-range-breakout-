@@ -9,6 +9,29 @@ st.set_page_config(page_title='ORB Strategy Dashboard', page_icon='📈', layout
 refresh_count = st_autorefresh(interval=15_000, key='orb_live_refresh')
 IST = ZoneInfo('Asia/Kolkata')
 
+
+def safe_timestamp(value):
+    """Render any supported timestamp value without crashing Streamlit."""
+    if value is None:
+        return 'None'
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = pd.to_datetime(value, errors='coerce')
+            if pd.isna(dt):
+                return 'None'
+            if hasattr(dt, 'to_pydatetime'):
+                dt = dt.to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        else:
+            dt = dt.astimezone(IST)
+        return dt.strftime('%Y-%m-%d %H:%M:%S IST')
+    except Exception:
+        return 'Unavailable'
+
+
 st.title('📈 ORB Strategy Dashboard')
 st.caption('NIFTY 500 • Paper trading only • 15-second refresh')
 
@@ -36,18 +59,6 @@ def get_engine(cid, tok, r, loss, target):
     return ORBEngine(cid, tok, r, loss, target)
 
 
-def format_quote_time(value):
-    """Render quote timestamps safely regardless of engine timestamp type."""
-    if value is None:
-        return 'None'
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=IST)
-        return value.astimezone(IST).strftime('%Y-%m-%d %H:%M:%S IST')
-    text = str(value).strip()
-    return text or 'None'
-
-
 engine = get_engine(client_id, token, risk, max_loss, rr)
 
 if not market_open():
@@ -69,7 +80,7 @@ st.info('Index data unavailable — no second Dhan request is made. The scanner 
 cols = st.columns(4)
 cols[0].metric('Index LTP', 'Index data unavailable')
 cols[1].metric('Source', source)
-cols[2].metric('Last successful quote', format_quote_time(last_successful_quote))
+cols[2].metric('Last successful quote', safe_timestamp(last_successful_quote))
 cols[3].metric('Trading allowed', 'YES' if engine.can_trade() else 'NO')
 
 st.subheader('NIFTY 500 scanner')
