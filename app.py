@@ -39,7 +39,9 @@ index = engine.index_metrics() or {}
 
 ltp = index.get("LTP")
 pdc = index.get("PDC")
-change = ((ltp - pdc) / pdc * 100) if ltp is not None and pdc else None
+change = index.get("Today %")
+if change is None and ltp is not None and pdc:
+    change = ((ltp - pdc) / pdc * 100)
 values = [ltp, pdc, change, engine.daily_pnl()]
 metric_cols = st.columns(4)
 labels = ["NIFTY 500 index LTP", "NIFTY 500 index PDC", "NIFTY 500 today % vs PDC", "Daily P&L"]
@@ -52,8 +54,16 @@ for col, label, value, kind in zip(metric_cols, labels, values, ["price", "price
         display = f"{value:,.2f}"
     col.metric(label, display)
 
+if index:
+    status = index.get("Market status")
+    sid = index.get("Security ID")
+    if status == "CLOSED / LAST CLOSE":
+        st.info(f"NIFTY 500 market is closed. Showing the latest available PDC/close from Dhan. Index security ID: {sid}")
+    elif status == "LIVE":
+        st.success(f"NIFTY 500 live data connected through Dhan. Index security ID: {sid}")
+
 st.subheader("NIFTY 500 alignment scanner")
-st.caption("NIFTY 500 constituents • Dhan live LTP • quote/session date • one scan per 15-second refresh")
+st.caption("NIFTY 500 constituents • Dhan live/last available LTP • automatic refresh every 15 seconds")
 if all_stocks.empty:
     st.info("No Dhan LTP quotes returned in this scan. The next refresh will retry.")
 else:
@@ -79,5 +89,5 @@ with st.expander("⚙️ Symbol / security configuration", expanded=False):
 if engine.last_error:
     st.error(f"Live data diagnostic: {engine.last_error}")
 else:
-    st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
+    st.success("Data source: Dhan • Universe: NIFTY 500 • Refresh interval: 15 seconds")
 st.caption(f"Dashboard time: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} IST")
