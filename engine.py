@@ -15,7 +15,6 @@ import requests
 API = "https://api.dhan.co/v2"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-LIVE_CACHE_FILE = Path(".dhan_live_cache.json")
 
 
 def norm(value):
@@ -44,21 +43,14 @@ class DhanClient:
     def ohlc(self, payload):
         if not self.client_id or not self.access_token:
             raise RuntimeError("Dhan Client ID and Access Token are required.")
+        response = self.session.post(f"{API}/marketfeed/ohlc", json=payload, timeout=(5, 25))
+        if response.status_code == 429:
+            raise RuntimeError("Dhan rate limit 429. The app is configured for one live batch per 15 seconds.")
+        if response.status_code >= 400:
+            body = response.text[:300].replace("\n", " ")
+            raise RuntimeError(f"Dhan HTTP {response.status_code}: {body}")
         try:
-            response = self.session.post(
-                f"{API}/marketfeed/ohlc",
-                json=payload,
-                timeout=(5, 25),
-            )
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After", "15")
-                raise RuntimeError(
-                    f"Dhan rate limit (429). Keep one request per 15 seconds; retry after {retry_after}s."
-                )
-            response.raise_for_status()
             data = response.json()
-        except requests.RequestException as exc:
-            raise RuntimeError(f"Dhan request failed: {exc}") from exc
         except ValueError as exc:
             raise RuntimeError("Dhan returned invalid JSON.") from exc
         if isinstance(data, dict) and str(data.get("status", "")).lower() in {"failure", "failed", "error"}:
@@ -68,31 +60,19 @@ class DhanClient:
 
 @lru_cache(maxsize=1)
 def universe():
-    response = requests.get(
-        NIFTY500_URL,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=(5, 20),
-    )
+    response = requests.get(NIFTY500_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=(5, 20))
     response.raise_for_status()
     frame = pd.read_csv(io.BytesIO(response.content))
     columns = {norm(c): c for c in frame.columns}
     symbol_col = columns.get("SYMBOL") or columns.get("SYMBOLNAME")
     if not symbol_col:
-        raise RuntimeError(f"NIFTY 500 list has no symbol column: {list(frame.columns)[:20]}")
-    return sorted({
-        str(value).strip().upper()
-        for value in frame[symbol_col].dropna()
-        if str(value).strip()
-    })
+        raise RuntimeError(f"NIFTY 500 CSV has no symbol column: {list(frame.columns)[:20]}")
+    return sorted({str(v).strip().upper() for v in frame[symbol_col].dropna() if str(v).strip()})
 
 
 @lru_cache(maxsize=1)
 def master():
-    response = requests.get(
-        DHAN_MASTER_URL,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=(5, 30),
-    )
+    response = requests.get(DHAN_MASTER_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=(5, 30))
     response.raise_for_status()
     frame = pd.read_csv(io.BytesIO(response.content), low_memory=False, on_bad_lines="skip")
     columns = {norm(c): c for c in frame.columns}
@@ -101,24 +81,12 @@ def master():
         for name in names:
             if norm(name) in columns:
                 return columns[norm(name)]
-        for name in names:
-            wanted = norm(name)
-            for normalized, original in columns.items():
-                if wanted in normalized or normalized in wanted:
-                    return original
         return None
 
-    security_col = find(
-        "SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID", "SECURITYID"
-    )
-    symbol_col = find(
-        "SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "TRADING_SYMBOL",
-        "TRADINGSYMBOL", "SYMBOLNAME"
-    )
-    segment_col = find(
-        "SEM_SEGMENT", "SEGMENT", "SEM_EXM_EXCH_ID", "EXCHANGE_ID",
-        "EXCHID", "EXCHANGE"
-    )
+    security_col = find("SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID", "SECURITYID")
+    symbol_col = find("SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "TRADING_SYMBOL", "TRADINGSYMBOL", "SYMBOLNAME")
+    segment_col = find("SEM_SEGMENT", "SEGMENT")
+    exchange_col = find("SEM_EXM_EXCH_ID", "EXCHANGE_ID", "EXCHID", "EXCHANGE")
     if not security_col or not symbol_col:
         raise RuntimeError(f"Dhan master schema not recognized: {list(frame.columns)[:30]}")
 
@@ -127,12 +95,14 @@ def master():
         symbol = str(row.get(symbol_col, "")).strip().upper()
         security_id = str(row.get(security_col, "")).strip()
         segment = str(row.get(segment_col, "")).upper() if segment_col else ""
+        exchange = str(row.get(exchange_col, "")).upper() if exchange_col else ""
         if not symbol or symbol in {"NAN", "NONE"} or not security_id.isdigit():
             continue
         item = {"symbol": symbol, "security_id": security_id}
-        if "IDX" in segment or "INDEX" in segment or "NIFTY500" in norm(symbol):
+        is_index = "IDX" in segment or "INDEX" in segment or "IDX" in exchange
+        if is_index:
             indices.append(item)
-        else:
+        elif exchange in {"NSE", "NSE_EQ", "NSE_EQ"} or not exchange_col:
             equities.setdefault(symbol, item)
     return equities, indices
 
@@ -165,101 +135,61 @@ class ORBEngine:
         root = data.get("data", {}) if isinstance(data, dict) else {}
         return root.get(key, {}) if isinstance(root, dict) else {}
 
-    def _read_disk_cache(self):
-        try:
-            if not LIVE_CACHE_FILE.exists():
-                return None
-            payload = json.loads(LIVE_CACHE_FILE.read_text())
-            if time.time() - float(payload.get("at", 0)) < 15 and isinstance(payload.get("rows"), list):
-                return payload
-        except Exception:
+    @staticmethod
+    def _quote(bucket, security_id):
+        if not isinstance(bucket, dict):
             return None
-        return None
-
-    def _write_disk_cache(self, rows, index):
-        try:
-            LIVE_CACHE_FILE.write_text(json.dumps({"at": time.time(), "rows": rows, "index": index}))
-        except Exception:
-            pass
+        return bucket.get(str(security_id)) or bucket.get(int(security_id))
 
     def stock_scan(self):
         now = time.monotonic()
         if self._cache["df"] is not None and now - self._cache["at"] < 15:
             return self._cache["df"]
-
-        disk = self._read_disk_cache()
-        if disk:
-            result = pd.DataFrame(disk["rows"])
-            self._cache = {"at": now, "df": result, "index": disk.get("index")}
-            self.last_error = ""
-            return result
-
         try:
             names = universe()
             equities, indices = master()
             configs = [equities[s] for s in names if s in equities]
             if not configs:
-                raise RuntimeError("No NIFTY 500 NSE equity instruments matched Dhan master.")
+                raise RuntimeError("No NSE NIFTY 500 equities matched the Dhan instrument master.")
 
-            index_candidates = [
-                item for item in indices
-                if norm(item["symbol"]) in {"NIFTY500", "NIFTY500INDEX"}
-                or "NIFTY500" in norm(item["symbol"])
-            ]
-            payload = {"NSE_EQ": [int(item["security_id"]) for item in configs]}
+            index_candidates = [i for i in indices if "NIFTY500" in norm(i["symbol"])]
+            payload = {"NSE_EQ": [int(i["security_id"]) for i in configs]}
             if index_candidates:
-                payload["NSE_IDX"] = [int(item["security_id"]) for item in index_candidates[:3]]
+                payload["NSE_IDX"] = [int(i["security_id"]) for i in index_candidates[:1]]
 
-            data = self.dhan.ohlc(payload)
+            data = self.dhan.ohlc(payload)  # exactly one live Dhan request per refresh
             eq = self._root(data, "NSE_EQ")
             idx = self._root(data, "NSE_IDX")
             index_value = None
             for item in index_candidates:
-                quote = idx.get(item["security_id"]) or idx.get(int(item["security_id"]))
+                quote = self._quote(idx, item["security_id"])
                 if isinstance(quote, dict) and quote.get("last_price") not in (None, ""):
                     ohlc = quote.get("ohlc") or {}
-                    pdc = ohlc.get("close")
-                    index_value = {
-                        "LTP": float(quote["last_price"]),
-                        "PDC": float(pdc) if pdc not in (None, "", 0) else None,
-                    }
+                    close = ohlc.get("close")
+                    index_value = {"LTP": float(quote["last_price"]), "PDC": float(close) if close not in (None, "", 0) else None}
                     break
 
             rows = []
             for item in configs:
-                quote = eq.get(item["security_id"]) or eq.get(int(item["security_id"]))
+                quote = self._quote(eq, item["security_id"])
                 if not isinstance(quote, dict) or quote.get("last_price") in (None, ""):
                     continue
                 ohlc = quote.get("ohlc") or {}
                 ltp = float(quote["last_price"])
-                pdc = ohlc.get("close")
-                pdc_value = float(pdc) if pdc not in (None, "", 0) else None
-                rows.append({
-                    "Symbol": item["symbol"],
-                    "LTP": ltp,
-                    "Open": ohlc.get("open"),
-                    "PDC": pdc,
-                    "Today %": ((ltp - pdc_value) / pdc_value * 100) if pdc_value else None,
-                    "1W %": None,
-                    "1M %": None,
-                    "3M %": None,
-                    "ORB High": None,
-                    "ORB Low": None,
-                    "Buy condition": "WAIT",
-                })
-
+                close = ohlc.get("close")
+                pdc = float(close) if close not in (None, "", 0) else None
+                rows.append({"Symbol": item["symbol"], "LTP": ltp, "Open": ohlc.get("open"), "PDC": pdc,
+                             "Today %": ((ltp - pdc) / pdc * 100) if pdc else None,
+                             "1W %": None, "1M %": None, "3M %": None,
+                             "ORB High": None, "ORB Low": None, "Buy condition": "WAIT"})
+            if not rows:
+                raise RuntimeError("Dhan returned no NSE_EQ quotes for the NIFTY 500 batch.")
             result = pd.DataFrame(rows)
-            self.last_error = "" if not result.empty else "Dhan returned no NIFTY 500 quotes."
-            self._write_disk_cache(rows, index_value)
+            self.last_error = "" if index_value else "NIFTY 500 index quote not found in Dhan master; stock data is available."
             self._cache = {"at": now, "df": result, "index": index_value}
             return result
         except Exception as exc:
             self.last_error = f"NIFTY 500 scan error: {type(exc).__name__}: {exc}"
-            stale = self._read_disk_cache()
-            if stale and isinstance(stale.get("rows"), list):
-                result = pd.DataFrame(stale["rows"])
-                self._cache = {"at": now, "df": result, "index": stale.get("index")}
-                return result
             result = pd.DataFrame([{"Status": self.last_error}])
             self._cache = {"at": now, "df": result, "index": None}
             return result
@@ -272,9 +202,7 @@ class ORBEngine:
         frame = self.stock_scan()
         if "Buy condition" not in frame.columns:
             return frame
-        if direction == "BUY":
-            return frame[frame["Buy condition"] == "BUY"].reset_index(drop=True)
-        return frame[frame["Buy condition"] != "BUY"].reset_index(drop=True)
+        return frame[frame["Buy condition"] == "BUY"].reset_index(drop=True) if direction == "BUY" else frame[frame["Buy condition"] != "BUY"].reset_index(drop=True)
 
     def today_positions(self):
         return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) == str(self._today)])
@@ -283,7 +211,7 @@ class ORBEngine:
         return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) != str(self._today)])
 
     def strategy_markdown(self):
-        return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan batch containing NSE equities and the NIFTY 500 index per 15-second refresh. Paper trading only."
+        return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan batch request per 15-second refresh. Paper trading only."
 
     def config_table(self):
         return pd.DataFrame()
