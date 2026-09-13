@@ -1,5 +1,6 @@
 import streamlit as st
 from datetime import datetime
+import time as time_module
 import pandas as pd
 from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine
@@ -33,6 +34,28 @@ with st.sidebar:
 engine = ORBEngine(client_id=client_id, access_token=access_token, risk_per_trade=per_trade_risk,
                    max_daily_loss=max_day_loss, target_rr=target_rr)
 
+# IMPORTANT: the engine uses the same Dhan client for snapshot, market table,
+# BUY setups and SELL setups. Cache the LTP response once per refresh cycle so
+# all sections reuse one API response instead of making duplicate requests.
+_original_ltp = engine.dhan.ltp
+_ltp_cache = {"time": 0.0, "response": None}
+_ltp_cache_ttl = 15.0
+
+def cached_ltp(securities):
+    now = time_module.monotonic()
+    if (
+        _ltp_cache["response"] is not None
+        and now - _ltp_cache["time"] < _ltp_cache_ttl
+    ):
+        return _ltp_cache["response"]
+
+    response = _original_ltp(securities)
+    _ltp_cache["response"] = response
+    _ltp_cache["time"] = now
+    return response
+
+engine.dhan.ltp = cached_ltp
+
 if st.button("🔄 Refresh now", type="primary", use_container_width=True):
     st.rerun()
 
@@ -40,7 +63,7 @@ status = engine.snapshot()
 
 cols = st.columns(6)
 metrics = [
-    ("Nifty 500", status.get("nifty500_ltp"), status.get("nifty500_change")),
+    ("Last traded price", status.get("nifty500_ltp"), status.get("nifty500_change")),
     ("PDC", status.get("pdc"), None),
     ("1W Close", status.get("week_close"), None),
     ("1M Close", status.get("month_close"), None),
