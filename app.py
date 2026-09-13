@@ -5,6 +5,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine, market_open
 
+APP_VERSION = '2026-09-13-v7'
 st.set_page_config(page_title='ORB Strategy Dashboard', page_icon='📈', layout='wide')
 refresh_count = st_autorefresh(interval=15_000, key='orb_live_refresh')
 IST = ZoneInfo('Asia/Kolkata')
@@ -33,7 +34,7 @@ def safe_timestamp(value):
 
 
 st.title('📈 ORB Strategy Dashboard')
-st.caption('NIFTY 500 • Paper trading only • 15-second refresh')
+st.caption(f'NIFTY 500 • Paper trading only • 15-second refresh • {APP_VERSION}')
 
 with st.sidebar:
     st.header('Dhan connection')
