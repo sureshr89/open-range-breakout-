@@ -55,14 +55,11 @@ for col, value, kind in zip(metric_cols, values, ["price", "price", "change", "p
     col.metric("", display)
 
 st.subheader("NIFTY 500 alignment scanner")
-st.caption("NIFTY 500 constituents • Dhan live LTP • last traded date • one scan per 15-second refresh")
+st.caption("NIFTY 500 constituents • Dhan live LTP • quote/session date • one scan per 15-second refresh")
 if all_stocks.empty:
     st.info("No Dhan LTP quotes returned in this scan. The next refresh will retry.")
 else:
-    table = all_stocks.copy()
-    if "Symbol" in table.columns and "Last Traded Date" not in table.columns:
-        table.insert(1, "Last Traded Date", datetime.now().strftime("%Y-%m-%d"))
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(all_stocks, use_container_width=True, hide_index=True)
 
 st.subheader("Buy setups")
 st.dataframe(engine.setup_table("BUY"), use_container_width=True, hide_index=True)
