@@ -5,7 +5,6 @@ from engine import ORBEngine
 
 st.set_page_config(page_title="ORB Strategy Dashboard", page_icon="📈", layout="wide")
 refresh_count = st_autorefresh(interval=15_000, key="orb_live_refresh")
-
 st.title("📈 ORB Strategy Dashboard")
 st.caption("Dhan market-data driven • Paper-trading logic • Auto-refresh every 15 seconds")
 
@@ -13,10 +12,7 @@ with st.sidebar:
     st.header("Dhan connection")
     client_id = str(st.secrets.get("DHAN_CLIENT_ID", "") or "").strip()
     access_token = str(st.secrets.get("DHAN_ACCESS_TOKEN", "") or "").strip()
-    if client_id and access_token:
-        st.success("Dhan secrets loaded")
-    else:
-        st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in Streamlit Secrets")
+    st.success("Dhan secrets loaded") if client_id and access_token else st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN")
     st.divider()
     st.subheader("Risk controls")
     per_trade_risk = st.number_input("Risk / trade (₹)", min_value=2000, max_value=2500, value=2250, step=50)
@@ -28,33 +24,19 @@ with st.sidebar:
     st.caption(f"Refresh #{refresh_count} • every 15 seconds")
 
 engine = ORBEngine(client_id, access_token, per_trade_risk, max_day_loss, target_rr)
-
-# Always render the dashboard, even if a remote NSE/Dhan request fails.
-# The engine itself caches the scan during this Streamlit run.
 try:
     all_stocks = engine.stock_scan()
 except Exception as exc:
     all_stocks = __import__("pandas").DataFrame()
     engine.last_error = f"Scanner error: {type(exc).__name__}: {exc}"
 
-
-def mean_value(column):
-    if all_stocks.empty or column not in all_stocks.columns:
-        return None
-    values = __import__("pandas").to_numeric(all_stocks[column], errors="coerce").dropna()
-    return float(values.mean()) if not values.empty else None
-
-basket_ltp = mean_value("LTP")
-basket_pdc = mean_value("PDC")
-basket_change_pct = mean_value("Today %")
+index = engine.index_metrics() or {}
+ltp = index.get("LTP")
+pdc = index.get("PDC")
+change = ((ltp - pdc) / pdc * 100) if ltp is not None and pdc else None
 
 cols = st.columns(4)
-metrics = [
-    ("NIFTY 500 basket LTP", basket_ltp, None),
-    ("NIFTY 500 average PDC", basket_pdc, None),
-    ("NIFTY 500 today % vs PDC", basket_change_pct, "%"),
-    ("Daily P&L", engine.daily_pnl(), None),
-]
+metrics = [("NIFTY 500 index LTP", ltp, None), ("NIFTY 500 index PDC", pdc, None), ("NIFTY 500 today % vs PDC", change, "%"), ("Daily P&L", engine.daily_pnl(), None)]
 for col, (label, value, suffix) in zip(cols, metrics):
     display = "—" if value is None else (f"{value:+.2f}%" if suffix == "%" else f"{value:,.2f}")
     col.metric(label, display)
@@ -75,13 +57,8 @@ st.dataframe(engine.today_positions(), use_container_width=True, hide_index=True
 st.subheader("Past position details")
 st.dataframe(engine.past_positions(), use_container_width=True, hide_index=True)
 
-with st.expander("📘 Complete strategy", expanded=False):
-    st.markdown(engine.strategy_markdown())
-with st.expander("⚙️ Symbol / security configuration", expanded=False):
-    st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
-
-if engine.last_error:
-    st.warning(engine.last_error)
-else:
-    st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
+with st.expander("📘 Complete strategy", expanded=False): st.markdown(engine.strategy_markdown())
+with st.expander("⚙️ Symbol / security configuration", expanded=False): st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
+if engine.last_error: st.warning(engine.last_error)
+else: st.success("Data source: Dhan • Universe: NIFTY 500 • One scan per 15-second refresh")
 st.caption(f"Dashboard time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
