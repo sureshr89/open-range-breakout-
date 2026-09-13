@@ -19,7 +19,8 @@ class RiskState:
 
 class DhanClient:
     def __init__(self, client_id: str, access_token: str):
-        self.client_id, self.access_token = client_id.strip(), access_token.strip()
+        self.client_id = (client_id or "").strip()
+        self.access_token = (access_token or "").strip()
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json", "Accept": "application/json", "access-token": self.access_token, "client-id": self.client_id})
 
@@ -36,7 +37,7 @@ class DhanClient:
         except Exception:
             response.raise_for_status()
             raise RuntimeError(f"Dhan returned HTTP {response.status_code}")
-        if response.status_code >= 400 or (isinstance(data, dict) and data.get("status") == "failure"):
+        if response.status_code >= 400 or (isinstance(data, dict) and str(data.get("status", "")).lower() == "failure"):
             message = data.get("remarks") or data.get("message") or data.get("errorMessage") or str(data)
             raise RuntimeError(f"Dhan HTTP {response.status_code}: {message}")
         return data
@@ -56,7 +57,7 @@ class DhanClient:
 def _to_df(data):
     if not isinstance(data, dict) or "timestamp" not in data:
         return pd.DataFrame()
-    n = len(data["timestamp"])
+    n = len(data.get("timestamp", []))
     frame = pd.DataFrame({k: data.get(k, [None] * n) for k in ["timestamp", "open", "high", "low", "close", "volume"]})
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="s", errors="coerce")
     return frame.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
@@ -105,16 +106,23 @@ class ORBEngine:
         if cached and time_module.monotonic() - cached[0] < 900:
             return cached[1]
         frame = _to_df(self.dhan.daily(c["security_id"], c["exchange"], c["instrument"], (self._today - timedelta(days=150)).strftime("%Y-%m-%d"), (self._today + timedelta(days=1)).strftime("%Y-%m-%d")))
-        if len(frame) < 2:
-            refs = {"pdc": None, "week_close": None, "month_close": None, "quarter_close": None}
-        else:
-            closes = pd.to_numeric(frame["close"], errors="coerce").dropna().reset_index(drop=True)
-            refs = {"pdc": float(closes.iloc[-2]) if len(closes) >= 2 else None, "week_close": float(closes.iloc[-6]) if len(closes) >= 6 else None, "month_close": float(closes.iloc[-22]) if len(closes) >= 22 else None, "quarter_close": float(closes.iloc[-66]) if len(closes) >= 66 else None}
+        closes = pd.to_numeric(frame.get("close", pd.Series(dtype=float)), errors="coerce").dropna().reset_index(drop=True)
+        refs = {"pdc": None, "week_close": None, "month_close": None, "quarter_close": None}
+        if len(closes) >= 2:
+            refs["pdc"] = float(closes.iloc[-2])
+        if len(closes) >= 6:
+            refs["week_close"] = float(closes.iloc[-6])
+        if len(closes) >= 22:
+            refs["month_close"] = float(closes.iloc[-22])
+        if len(closes) >= 66:
+            refs["quarter_close"] = float(closes.iloc[-66])
         self._stock_cache[key] = (time_module.monotonic(), refs)
         return refs
 
     def opening_range(self, c):
         frame = _to_df(self.dhan.intraday(c["security_id"], c["exchange"], c["instrument"], "1", f"{self._today} 09:15:00", f"{self._today} 09:30:00"))
+        if frame.empty:
+            return None
         frame = frame[(frame.timestamp.dt.time >= time(9, 15)) & (frame.timestamp.dt.time < time(9, 30))]
         return None if frame.empty else {"high": float(frame.high.max()), "low": float(frame.low.min())}
 
@@ -124,7 +132,8 @@ class ORBEngine:
         response = requests.get(NIFTY500_URL, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
         frame = pd.read_csv(io.BytesIO(response.content))
-        symbol_col = next((c for c in frame.columns if str(c).strip().lower() in {"symbol", "symbol name"}), None)
+        columns = {str(c).strip().lower(): c for c in frame.columns}
+        symbol_col = columns.get("symbol") or columns.get("symbol name")
         if not symbol_col:
             raise RuntimeError(f"NIFTY 500 CSV has no Symbol column. Columns: {list(frame.columns)}")
         self._universe_cache = sorted({str(x).strip().upper() for x in frame[symbol_col].dropna() if str(x).strip()})
@@ -136,50 +145,62 @@ class ORBEngine:
         response = requests.get(DHAN_MASTER_URL, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
         frame = pd.read_csv(io.BytesIO(response.content), low_memory=False)
-        frame.columns = [str(c).strip().upper() for c in frame.columns]
+        frame.columns = [str(c).strip().upper().replace(" ", "_") for c in frame.columns]
 
         def find(*names):
-            return next((name for name in names if name in frame.columns), None)
+            for name in names:
+                if name in frame.columns:
+                    return name
+            return None
 
-        sid_col = find("SECURITY_ID", "SECURITYID")
-        symbol_col = find("SYMBOL_NAME", "SYMBOL", "TRADING_SYMBOL")
-        exchange_col = find("EXCH_ID", "EXCHANGE")
-        segment_col = find("SEGMENT", "EXCHANGE_SEGMENT")
-        instrument_col = find("INSTRUMENT", "INSTRUMENT_TYPE")
+        # Dhan has used several master-file schemas. Support both old and new names.
+        sid_col = find("SECURITY_ID", "SECURITYID", "SEM_SMST_SECURITY_ID", "SMST_SECURITY_ID", "SECURITY_ID_NEW")
+        symbol_col = find("SYMBOL_NAME", "SYMBOL", "TRADING_SYMBOL", "SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "CUSTOM_SYMBOL")
+        exchange_col = find("EXCH_ID", "EXCHANGE", "SEM_EXM_EXCH_ID", "EXCHANGE_ID")
+        segment_col = find("SEGMENT", "EXCHANGE_SEGMENT", "SEM_SEGMENT", "SEM_EXM_EXCH_ID")
+        instrument_col = find("INSTRUMENT", "INSTRUMENT_TYPE", "INSTRUMENT_NAME", "SEM_INSTRUMENT_NAME")
         if not sid_col or not symbol_col:
-            raise RuntimeError(f"Dhan master format changed. Columns: {list(frame.columns)[:30]}")
+            # Do not crash the entire Streamlit page with a redacted RuntimeError.
+            self.last_error = f"Dhan master schema not recognized. Available columns: {', '.join(frame.columns[:20])}"
+            self._master_cache = {}
+            return self._master_cache
 
         if exchange_col:
-            frame = frame[frame[exchange_col].astype(str).str.upper().isin({"NSE", "NSE_EQ", "NSE EQUITY"})]
-        if segment_col:
-            segment_values = frame[segment_col].astype(str).str.upper()
-            frame = frame[segment_values.isin({"E", "EQ", "EQUITY", "NSE_EQ", "NSE EQUITY"}) | frame[segment_col].isna()]
+            values = frame[exchange_col].astype(str).str.upper().str.strip()
+            frame = frame[values.isin({"NSE", "NSE_EQ", "NSE EQUITY", "NSE_EQ_CASH", "NSE"}) | values.str.contains("NSE", na=False)]
         if instrument_col:
-            instrument_values = frame[instrument_col].astype(str).str.upper()
-            frame = frame[instrument_values.isin({"EQUITY", "EQ", "E"}) | frame[instrument_col].isna()]
+            values = frame[instrument_col].astype(str).str.upper().str.strip()
+            frame = frame[values.isin({"EQUITY", "EQ", "E", "ES", "STOCK"}) | values.str.contains("EQUITY", na=False) | values.isin({"NAN", "NONE"})]
 
         master = {}
         for _, row in frame.iterrows():
-            symbol = str(row[symbol_col]).strip().upper()
-            sid = str(row[sid_col]).strip()
-            if symbol and sid and sid.lower() != "nan" and symbol not in master:
+            symbol = str(row.get(symbol_col, "")).strip().upper()
+            sid = str(row.get(sid_col, "")).strip()
+            if not symbol or symbol.lower() == "nan" or not sid or sid.lower() == "nan":
+                continue
+            if symbol not in master:
                 master[symbol] = {"security_id": sid, "exchange": "NSE_EQ", "instrument": "EQUITY", "symbol": symbol}
         self._master_cache = master
+        if not master:
+            self.last_error = "Dhan master loaded but no NSE equity instruments were found."
         return master
 
     def stock_scan(self):
         if self._scan_cache["df"] is not None and time_module.monotonic() - self._scan_cache["at"] < 15:
             return self._scan_cache["df"]
-        universe, master = self._load_universe(), self._load_master()
-        configs = [master[s] for s in universe if s in master]
-        rows, quote_errors = [], 0
+        try:
+            universe, master = self._load_universe(), self._load_master()
+            configs = [master[s] for s in universe if s in master]
+        except Exception as exc:
+            self.last_error = str(exc)
+            return pd.DataFrame()
+        rows = []
         for start in range(0, len(configs), 1000):
             batch = configs[start:start + 1000]
-            ids = [int(c["security_id"]) for c in batch]
             try:
-                quotes = self.dhan.ohlc({"NSE_EQ": ids})
-            except Exception:
-                quote_errors += 1
+                quotes = self.dhan.ohlc({"NSE_EQ": [int(c["security_id"]) for c in batch]})
+            except Exception as exc:
+                self.last_error = str(exc)
                 continue
             for c in batch:
                 try:
@@ -191,16 +212,13 @@ class ORBEngine:
                     op = float(ohlc.get("open")) if ohlc.get("open") not in (None, "", 0) else None
                     pdc = float(ohlc.get("close")) if ohlc.get("close") not in (None, "", 0) else None
                     refs = self.reference_levels(c)
-                    if pdc is None:
-                        pdc = refs.get("pdc")
-                    orb = self.opening_range(c)
-                    orh, orl = (orb or {}).get("high"), (orb or {}).get("low")
-                    rows.append({"Symbol": c["symbol"], "LTP": ltp, "Open": op, "PDC": pdc, "Today %": ((ltp - pdc) / pdc * 100 if pdc else None), "1W %": ((ltp - refs["week_close"]) / refs["week_close"] * 100 if refs.get("week_close") else None), "1M %": ((ltp - refs["month_close"]) / refs["month_close"] * 100 if refs.get("month_close") else None), "3M %": ((ltp - refs["quarter_close"]) / refs["quarter_close"] * 100 if refs.get("quarter_close") else None), "ORB High": orh, "ORB Low": orl, "Buy condition": "BUY" if orh is not None and ltp > orh else "WAIT"})
+                    pdc = pdc or refs.get("pdc")
+                    orb = self.opening_range(c) or {}
+                    orh, orl = orb.get("high"), orb.get("low")
+                    rows.append({"Symbol": c["symbol"], "LTP": ltp, "Open": op, "PDC": pdc, "Today %": ((ltp-pdc)/pdc*100 if pdc else None), "1W %": ((ltp-refs["week_close"])/refs["week_close"]*100 if refs.get("week_close") else None), "1M %": ((ltp-refs["month_close"])/refs["month_close"]*100 if refs.get("month_close") else None), "3M %": ((ltp-refs["quarter_close"])/refs["quarter_close"]*100 if refs.get("quarter_close") else None), "ORB High": orh, "ORB Low": orl, "Buy condition": "BUY" if orh is not None and ltp > orh else "WAIT"})
                 except Exception:
                     continue
         result = pd.DataFrame(rows)
-        if result.empty and quote_errors:
-            self.last_error = "Dhan OHLC request failed for all batches. Check Data API access and credentials."
         self._scan_cache = {"at": time_module.monotonic(), "df": result}
         return result
 
@@ -225,7 +243,7 @@ class ORBEngine:
     def setup_table(self, direction):
         frame = self.stock_scan()
         if frame.empty:
-            return pd.DataFrame([{"Status": "No stock data returned. Check Dhan Data API access and credentials."}])
+            return pd.DataFrame([{"Status": self.last_error or "No stock data returned."}])
         if direction == "BUY":
             return frame[frame["Buy condition"] == "BUY"].sort_values("Today %", ascending=False).reset_index(drop=True)
         return frame[frame["Buy condition"] != "BUY"].sort_values("Today %", ascending=True).reset_index(drop=True)
