@@ -9,7 +9,6 @@ import pandas as pd
 API = "https://api.dhan.co/v2"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-
 DEFAULT_CONFIG = {"NIFTY": {"security_id": "13", "exchange": "IDX_I", "instrument": "INDEX", "symbol": "NIFTY"}}
 
 @dataclass
@@ -27,7 +26,7 @@ class DhanClient:
     def ready(self): return bool(self.client_id and self.access_token)
     def _post(self, path, payload):
         if not self.ready: raise RuntimeError("Dhan Client ID and Access Token are required.")
-        r = self.session.post(f"{API}{path}", json=payload, timeout=20); r.raise_for_status(); data=r.json()
+        r = self.session.post(f"{API}{path}", json=payload, timeout=30); r.raise_for_status(); data=r.json()
         if isinstance(data, dict) and data.get("status") == "failure": raise RuntimeError(data.get("remarks") or data.get("message") or str(data))
         return data
     def ltp(self, securities): return self._post("/marketfeed/ltp", securities)
@@ -53,8 +52,11 @@ class ORBEngine:
         self.state.setdefault("positions",[])
     def daily_pnl(self): return float(sum(float(p.get("pnl",0)) for p in self.state["positions"] if str(p.get("date"))==str(self._today)))
     def _cfg(self): return self.config["NIFTY"]
+    def _quote_item(self, data, segment, sid):
+        block=data.get("data",{}).get(segment,{}) if isinstance(data,dict) else {}
+        return block.get(str(sid)) or block.get(int(sid))
     def _nifty500_ltp(self):
-        c=self._cfg(); q=self.dhan.ltp({c["exchange"]:[int(c["security_id"])]}); item=q.get("data",{}).get(c["exchange"],{}).get(str(c["security_id"])) or q.get("data",{}).get(c["exchange"],{}).get(int(c["security_id"]))
+        c=self._cfg(); item=self._quote_item(self.dhan.ltp({c["exchange"]:[int(c["security_id"])]}),c["exchange"],c["security_id"])
         if not item: raise RuntimeError("Dhan returned no NIFTY quote for securityId 13")
         return float(item["last_price"])
     def reference_levels(self, c):
@@ -70,36 +72,37 @@ class ORBEngine:
         return None if d.empty else {"high":float(d.high.max()),"low":float(d.low.min())}
     def _load_universe(self):
         if self._universe_cache is not None: return self._universe_cache
-        r=requests.get(NIFTY500_URL,timeout=20,headers={"User-Agent":"Mozilla/5.0"}); r.raise_for_status(); df=pd.read_csv(io.BytesIO(r.content))
+        r=requests.get(NIFTY500_URL,timeout=30,headers={"User-Agent":"Mozilla/5.0"}); r.raise_for_status(); df=pd.read_csv(io.BytesIO(r.content))
         sym_col=next((c for c in df.columns if str(c).strip().lower() in ("symbol","symbol name")),None)
         if not sym_col: raise RuntimeError("NIFTY 500 constituent CSV has no Symbol column")
         self._universe_cache=[str(x).strip().upper() for x in df[sym_col].dropna().tolist()]
         return self._universe_cache
     def _load_master(self):
         if self._master_cache is not None: return self._master_cache
-        r=requests.get(DHAN_MASTER_URL,timeout=45); r.raise_for_status(); df=pd.read_csv(io.BytesIO(r.content),low_memory=False)
-        df.columns=[str(c).strip().upper() for c in df.columns]
+        r=requests.get(DHAN_MASTER_URL,timeout=60); r.raise_for_status(); df=pd.read_csv(io.BytesIO(r.content),low_memory=False); df.columns=[str(c).strip().upper() for c in df.columns]
         def col(*names): return next((n for n in names if n in df.columns),None)
-        sym, sid, exch, seg, inst = col("SYMBOL_NAME","SYMBOL"),col("SECURITY_ID"),col("EXCH_ID"),col("SEGMENT"),col("INSTRUMENT")
+        sym,sid,exch,seg=col("SYMBOL_NAME","SYMBOL"),col("SECURITY_ID"),col("EXCH_ID"),col("SEGMENT")
         if not all((sym,sid,exch)): raise RuntimeError("Dhan instrument master format changed")
-        df=df[(df[exch].astype(str).str.upper()=="NSE")]
+        df=df[df[exch].astype(str).str.upper()=="NSE"]
         if seg: df=df[df[seg].astype(str).str.upper().isin(["E","C","NSE_EQ","EQUITY"]) | df[seg].isna()]
         self._master_cache={str(row[sym]).strip().upper():{"security_id":str(row[sid]),"exchange":"NSE_EQ","instrument":"EQUITY","symbol":str(row[sym]).strip().upper()} for _,row in df.iterrows()}
         return self._master_cache
     def stock_scan(self):
         if self._scan_cache["df"] is not None and time_module.monotonic()-self._scan_cache["at"] < 15: return self._scan_cache["df"]
-        universe=self._load_universe(); master=self._load_master(); rows=[]
-        for symbol in universe:
-            c=master.get(symbol)
-            if not c: continue
-            try:
-                refs=self.reference_levels(c)
-                q=self.dhan.ltp({"NSE_EQ":[int(c["security_id"])]}); item=q.get("data",{}).get("NSE_EQ",{}).get(str(c["security_id"])) or q.get("data",{}).get("NSE_EQ",{}).get(int(c["security_id"]))
-                if not item: continue
-                ltp=float(item.get("last_price")); op=float(item.get("open",ltp)); pdc=refs.get("pdc")
-                orr=self.opening_range(c); orh=orr.get("high") if orr else None; orl=orr.get("low") if orr else None
-                rows.append({"Symbol":symbol,"LTP":ltp,"Open":op,"PDC":pdc,"Today %":((ltp-pdc)/pdc*100 if pdc else None),"1W %":((ltp-refs["week_close"])/refs["week_close"]*100 if refs.get("week_close") else None),"1M %":((ltp-refs["month_close"])/refs["month_close"]*100 if refs.get("month_close") else None),"3M %":((ltp-refs["quarter_close"])/refs["quarter_close"]*100 if refs.get("quarter_close") else None),"ORB High":orh,"ORB Low":orl,"Buy condition":("BUY" if orh is not None and ltp>orh else "WAIT")})
+        universe=self._load_universe(); master=self._load_master(); configs=[master[s] for s in universe if s in master]
+        rows=[]
+        # Dhan live LTP/open are fetched in batches; no Yahoo/NSE price is used.
+        for start in range(0,len(configs),100):
+            batch=configs[start:start+100]; ids=[int(c["security_id"]) for c in batch]
+            try: quotes=self.dhan.ltp({"NSE_EQ":ids})
             except Exception: continue
+            for c in batch:
+                try:
+                    item=self._quote_item(quotes,"NSE_EQ",c["security_id"])
+                    if not item: continue
+                    ltp=float(item.get("last_price")); op=float(item.get("open",ltp)); refs=self.reference_levels(c); pdc=refs.get("pdc"); orr=self.opening_range(c); orh=orr.get("high") if orr else None; orl=orr.get("low") if orr else None
+                    rows.append({"Symbol":c["symbol"],"LTP":ltp,"Open":op,"PDC":pdc,"Today %":((ltp-pdc)/pdc*100 if pdc else None),"1W %":((ltp-refs["week_close"])/refs["week_close"]*100 if refs.get("week_close") else None),"1M %":((ltp-refs["month_close"])/refs["month_close"]*100 if refs.get("month_close") else None),"3M %":((ltp-refs["quarter_close"])/refs["quarter_close"]*100 if refs.get("quarter_close") else None),"ORB High":orh,"ORB Low":orl,"Buy condition":("BUY" if orh is not None and ltp>orh else "WAIT")})
+                except Exception: continue
         df=pd.DataFrame(rows); self._scan_cache={"at":time_module.monotonic(),"df":df}; return df
     def snapshot(self):
         r={"warning":None,"data_status":"Disconnected","daily_pnl":self.daily_pnl(),"pdc":None,"week_close":None,"month_close":None,"quarter_close":None,"nifty500_ltp":None,"nifty500_change":None,"nifty500_change_pct":None}
@@ -113,10 +116,9 @@ class ORBEngine:
     def setup_table(self,direction):
         df=self.stock_scan()
         if df.empty: return pd.DataFrame([{"Status":"No stock data returned. Check Dhan credentials, NSE CSV access, and instrument master."}])
-        if direction=="BUY": return df[df["Buy condition"]=="BUY"].sort_values(["Today %"],ascending=False).reset_index(drop=True)
-        return df[df["Buy condition"]!="BUY"].sort_values(["Today %"],ascending=True).reset_index(drop=True)
+        return df[df["Buy condition"]=="BUY"].sort_values(["Today %"],ascending=False).reset_index(drop=True) if direction=="BUY" else df[df["Buy condition"]!="BUY"].sort_values(["Today %"],ascending=True).reset_index(drop=True)
     def market_table(self): return pd.DataFrame()
     def today_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date"))==str(self._today)])
     def past_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date"))!=str(self._today)])
-    def strategy_markdown(self): return "**Universe:** NIFTY 500 constituents. **ORB:** 09:15–09:29 IST. **Buy condition:** LTP > ORB High. **Alignment columns:** Today % vs PDC, 1W %, 1M %, 3M %. This is a paper-trading scanner; no orders are placed."
+    def strategy_markdown(self): return "**Universe:** NSE Nifty 500 constituent list. **Live LTP/Open:** Dhan batch market-feed only. **ORB:** Dhan 1-minute candles from 09:15–09:30 IST. **Buy condition:** LTP > ORB High. **Alignment:** Today % vs PDC, 1W %, 1M %, 3M %. Paper trading only."
     def config_table(self): return pd.DataFrame([{"Name":k,**v} for k,v in self.config.items()])
