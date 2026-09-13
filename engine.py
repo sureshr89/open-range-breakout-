@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -31,12 +31,14 @@ class DhanClient:
     def post(self, path, payload):
         if not self.ready:
             raise RuntimeError("Dhan Client ID and Access Token are required.")
-        r = self.session.post(f"{API}{path}", json=payload, timeout=15)
+        try:
+            r = self.session.post(f"{API}{path}", json=payload, timeout=(3, 8))
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Dhan request timed out/failed: {exc}") from exc
         try:
             data = r.json()
         except Exception:
-            r.raise_for_status()
-            raise RuntimeError(f"Dhan returned HTTP {r.status_code}")
+            raise RuntimeError(f"Dhan returned HTTP {r.status_code} with non-JSON response")
         if r.status_code >= 400 or str(data.get("status", "")).lower() == "failure":
             raise RuntimeError(str(data.get("remarks") or data.get("message") or data.get("errorMessage") or data))
         return data
@@ -46,7 +48,7 @@ class DhanClient:
 
 @lru_cache(maxsize=1)
 def _cached_universe():
-    r = requests.get(NIFTY500_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(NIFTY500_URL, timeout=(3, 8), headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     f = pd.read_csv(io.BytesIO(r.content))
     cols = {re.sub(r"[^A-Z0-9]", "", str(c).upper()): c for c in f.columns}
@@ -57,20 +59,17 @@ def _cached_universe():
 
 @lru_cache(maxsize=1)
 def _cached_master():
-    r = requests.get(DHAN_MASTER_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(DHAN_MASTER_URL, timeout=(3, 12), headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     f = pd.read_csv(io.BytesIO(r.content), low_memory=False, on_bad_lines="skip")
     original = list(f.columns)
     normalized = {re.sub(r"[^A-Z0-9]", "", str(c).upper()): c for c in f.columns}
 
-    def choose_exact(*names):
+    def choose(*names):
         for name in names:
             key = re.sub(r"[^A-Z0-9]", "", name.upper())
             if key in normalized:
                 return normalized[key]
-        return None
-
-    def choose_contains(*names):
         for name in names:
             key = re.sub(r"[^A-Z0-9]", "", name.upper())
             for actual, original_name in normalized.items():
@@ -78,20 +77,11 @@ def _cached_master():
                     return original_name
         return None
 
-    # Dhan has used both old and current master headers, including:
-    # SEM_SMST_SECURITY_ID, SEM_TRADING_SYMBOL and SEM_EXM_EXCH_ID.
-    sid = choose_exact(
-        "SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID", "SECURITYID"
-    ) or choose_contains("SMSTSECURITYID", "SECURITYID")
-    sym = choose_exact(
-        "SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "TRADING_SYMBOL", "TRADINGSYMBOL"
-    ) or choose_contains("TRADINGSYMBOL", "CUSTOMSYMBOL", "SYMBOLNAME")
-    exch = choose_exact(
-        "SEM_EXM_EXCH_ID", "SEM_EXCH_ID", "EXCHANGE_ID", "EXCHID"
-    ) or choose_contains("EXMEXCHID", "EXCHID", "EXCHANGE")
+    sid = choose("SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID", "SECURITYID")
+    sym = choose("SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "TRADING_SYMBOL", "TRADINGSYMBOL", "SYMBOLNAME")
+    exch = choose("SEM_EXM_EXCH_ID", "SEM_EXCH_ID", "EXCHANGE_ID", "EXCHID", "EXCHANGE")
     if not sid or not sym:
         raise RuntimeError(f"Dhan master schema not recognized: {original[:30]}")
-
     if exch:
         f = f[f[exch].astype(str).str.upper().isin(["NSE", "NSE_EQ", "NSECM", "NSE CM"])]
 
@@ -101,8 +91,7 @@ def _cached_master():
         security = str(row.get(sid, "")).strip()
         if symbol in ("", "NAN", "NONE") or security in ("", "NAN", "NONE"):
             continue
-        if symbol not in master:
-            master[symbol] = {"symbol": symbol, "security_id": security}
+        master.setdefault(symbol, {"symbol": symbol, "security_id": security})
     return master
 
 class ORBEngine:
@@ -126,11 +115,8 @@ class ORBEngine:
     def daily_pnl(self):
         return float(sum(float(p.get("pnl", 0)) for p in self.state["positions"] if str(p.get("date")) == str(self._today)))
 
-    def _load_universe(self):
-        return _cached_universe()
-
-    def _load_master(self):
-        return _cached_master()
+    def _load_universe(self): return _cached_universe()
+    def _load_master(self): return _cached_master()
 
     @staticmethod
     def _quote_map(data):
@@ -142,8 +128,7 @@ class ORBEngine:
         if self._scan_cache["df"] is not None and now - self._scan_cache["at"] < 15:
             return self._scan_cache["df"]
         try:
-            universe = self._load_universe()
-            master = self._load_master()
+            universe, master = self._load_universe(), self._load_master()
             configs = [master[s] for s in universe if s in master and str(master[s]["security_id"]).isdigit()]
             if not configs:
                 raise RuntimeError("No NIFTY 500 NSE equity instruments matched Dhan master.")
@@ -153,17 +138,14 @@ class ORBEngine:
             rows = []
             for c in configs:
                 item = qmap.get(str(c["security_id"])) or qmap.get(int(c["security_id"]))
-                if not item:
-                    continue
+                if not item: continue
                 o = item.get("ohlc") or {}
                 ltp = item.get("last_price")
-                if ltp in (None, ""):
-                    continue
-                op = o.get("open")
+                if ltp in (None, ""): continue
                 pdc = o.get("close")
                 pdc_num = float(pdc) if pdc not in (None, "", 0) else None
                 ltp_num = float(ltp)
-                rows.append({"Symbol": c["symbol"], "LTP": ltp_num, "Open": op, "PDC": pdc, "Today %": ((ltp_num-pdc_num)/pdc_num*100 if pdc_num else None), "1W %": None, "1M %": None, "3M %": None, "ORB High": None, "ORB Low": None, "Buy condition": "WAIT"})
+                rows.append({"Symbol": c["symbol"], "LTP": ltp_num, "Open": o.get("open"), "PDC": pdc, "Today %": ((ltp_num-pdc_num)/pdc_num*100 if pdc_num else None), "1W %": None, "1M %": None, "3M %": None, "ORB High": None, "ORB Low": None, "Buy condition": "WAIT"})
             result = pd.DataFrame(rows)
             self.last_error = "" if not result.empty else "Dhan returned no NIFTY 500 quotes."
         except Exception as e:
@@ -174,18 +156,10 @@ class ORBEngine:
 
     def setup_table(self, direction):
         f = self.stock_scan()
-        if f.empty or "Buy condition" not in f.columns:
-            return f
+        if f.empty or "Buy condition" not in f.columns: return f
         return f[f["Buy condition"] == "BUY"].reset_index(drop=True) if direction == "BUY" else f[f["Buy condition"] != "BUY"].reset_index(drop=True)
 
-    def today_positions(self):
-        return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) == str(self._today)])
-
-    def past_positions(self):
-        return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) != str(self._today)])
-
-    def strategy_markdown(self):
-        return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan NSE_EQ OHLC batch per 15-second refresh. **ORB/history:** shown when a separate cached candle source is added. Paper trading only."
-
-    def config_table(self):
-        return pd.DataFrame()
+    def today_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) == str(self._today)])
+    def past_positions(self): return pd.DataFrame([p for p in self.state["positions"] if str(p.get("date")) != str(self._today)])
+    def strategy_markdown(self): return "**Universe:** NSE NIFTY 500. **Live data:** one Dhan NSE_EQ OHLC batch per 15-second refresh. **ORB/history:** shown when a separate cached candle source is added. Paper trading only."
+    def config_table(self): return pd.DataFrame()
