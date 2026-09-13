@@ -21,16 +21,19 @@ def clean(value):
     return ''.join(ch for ch in str(value or '').upper() if ch.isalnum())
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def find_nifty500_security_id():
     urls = [
         'https://images.dhan.co/api-data/api-scrip-master-detailed.csv',
         'https://images.dhan.co/api-data/api-scrip-master.csv',
     ]
     id_keys = {'SECURITY_ID', 'SECURITYID', 'SEM_SMST_SECURITY_ID', 'SEM_SECURITY_ID'}
+    normalized_ids = {clean(k) for k in id_keys}
     name_keys = {'SEM_CUSTOM_SYMBOL', 'CUSTOM_SYMBOL', 'SYMBOL_NAME', 'SYMBOL', 'DISPLAY_NAME', 'UNDERLYING_SYMBOL', 'INSTRUMENT_NAME', 'SEM_TRADING_SYMBOL', 'TRADING_SYMBOL'}
+
     for url in urls:
         try:
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(3, 12))
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(2, 6))
             response.raise_for_status()
             reader = csv.DictReader(StringIO(response.text))
             for row in reader:
@@ -39,7 +42,7 @@ def find_nifty500_security_id():
                 if not any(v in {'NIFTY500', 'NIFTY500INDEX'} for v in names + values):
                     continue
                 for key, value in row.items():
-                    if clean(key) in {clean(k) for k in id_keys} and str(value).strip().isdigit():
+                    if clean(key) in normalized_ids and str(value).strip().isdigit():
                         return int(str(value).strip())
         except Exception:
             continue
@@ -98,7 +101,10 @@ with st.sidebar:
     st.header('Dhan connection')
     client_id = str(st.secrets.get('DHAN_CLIENT_ID', '') or '').strip()
     token = str(st.secrets.get('DHAN_ACCESS_TOKEN', '') or '').strip()
-    st.success('Dhan secrets loaded') if client_id and token else st.error('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
+    if client_id and token:
+        st.success('Dhan secrets loaded')
+    else:
+        st.error('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
     st.divider()
     st.subheader('Risk controls')
     risk = st.number_input('Risk / trade (₹)', min_value=1.0, max_value=100000.0, value=2250.0, step=50.0)
@@ -115,8 +121,8 @@ def get_engine(cid, tok, r, loss, target):
 
 
 engine = get_engine(client_id, token, risk, max_loss, rr)
-st.info('🔄 Loading NIFTY 500 index data...')
-index_data, index_warning = fetch_index(client_id, token)
+with st.spinner('🔄 Loading NIFTY 500 index data...'):
+    index_data, index_warning = fetch_index(client_id, token)
 
 if index_warning:
     st.warning(index_warning)
