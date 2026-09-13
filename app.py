@@ -5,8 +5,6 @@ from streamlit_autorefresh import st_autorefresh
 from engine import ORBEngine
 
 st.set_page_config(page_title="ORB Strategy Dashboard", page_icon="📈", layout="wide")
-
-# Automatic refresh every 15 seconds. No manual refresh button is needed.
 refresh_count = st_autorefresh(interval=15_000, key="orb_live_refresh")
 
 st.title("📈 ORB Strategy Dashboard")
@@ -16,10 +14,8 @@ with st.sidebar:
     st.header("Dhan connection")
     client_id = st.secrets.get("DHAN_CLIENT_ID", "").strip()
     access_token = st.secrets.get("DHAN_ACCESS_TOKEN", "").strip()
-    if client_id and access_token:
-        st.success("Dhan secrets loaded")
-    else:
-        st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in Streamlit Secrets")
+    if client_id and access_token: st.success("Dhan secrets loaded")
+    else: st.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in Streamlit Secrets")
     st.divider()
     st.subheader("Risk controls")
     per_trade_risk = st.number_input("Risk / trade (₹)", min_value=2000, max_value=2500, value=2250, step=50)
@@ -33,59 +29,46 @@ with st.sidebar:
 engine = ORBEngine(client_id=client_id, access_token=access_token, risk_per_trade=per_trade_risk,
                    max_daily_loss=max_day_loss, target_rr=target_rr)
 
-# Reuse one LTP response during each 15-second refresh cycle.
+# Cache each distinct Dhan LTP request for one refresh cycle.
 _original_ltp = engine.dhan.ltp
-_ltp_cache = {"time": 0.0, "response": None}
+_ltp_cache = {}
 _ltp_cache_ttl = 15.0
 
 def cached_ltp(securities):
+    key = repr(sorted((str(k), tuple(sorted(map(int, v)))) for k, v in securities.items()))
     now = time_module.monotonic()
-    if _ltp_cache["response"] is not None and now - _ltp_cache["time"] < _ltp_cache_ttl:
-        return _ltp_cache["response"]
+    cached = _ltp_cache.get(key)
+    if cached and now - cached[0] < _ltp_cache_ttl: return cached[1]
     response = _original_ltp(securities)
-    _ltp_cache["response"] = response
-    _ltp_cache["time"] = now
+    _ltp_cache[key] = (now, response)
     return response
 
 engine.dhan.ltp = cached_ltp
-
 status = engine.snapshot()
 
 cols = st.columns(4)
-metrics = [
-    ("NIFTY market LTP", status.get("nifty500_ltp"), None),
-    ("Previous-day close", status.get("pdc"), None),
-    ("Today % vs PDC", status.get("nifty500_change_pct"), "%"),
-    ("Daily P&L", status.get("daily_pnl"), None),
-]
+metrics = [("NIFTY market LTP", status.get("nifty500_ltp"), None), ("Previous-day close", status.get("pdc"), None), ("Today % vs PDC", status.get("nifty500_change_pct"), "%"), ("Daily P&L", status.get("daily_pnl"), None)]
 for c, (label, value, suffix) in zip(cols, metrics):
-    if value is None:
-        display = "—"
-    elif suffix == "%":
-        display = f"{value:+.2f}%"
-    else:
-        display = f"{value:,.2f}"
+    display = "—" if value is None else (f"{value:+.2f}%" if suffix == "%" else f"{value:,.2f}")
     c.metric(label, display)
 
-# The separate Live market data table was removed intentionally.
-# The dashboard now focuses on NIFTY 500 alignment and strategy setups.
+st.subheader("NIFTY 500 alignment scanner")
+st.caption("All available NIFTY 500 constituents with LTP, open, PDC, today/1W/1M/3M percentage alignment, ORB high/low, and buy condition.")
+all_stocks = engine.stock_scan()
+st.dataframe(all_stocks, use_container_width=True, hide_index=True)
+
 st.subheader("Buy setups")
 st.dataframe(engine.setup_table("BUY"), use_container_width=True, hide_index=True)
-st.subheader("Sell setups")
+st.subheader("Sell / waiting setups")
 st.dataframe(engine.setup_table("SELL"), use_container_width=True, hide_index=True)
 st.subheader("Today's position details")
 st.dataframe(engine.today_positions(), use_container_width=True, hide_index=True)
 st.subheader("Past position details")
 st.dataframe(engine.past_positions(), use_container_width=True, hide_index=True)
 
-with st.expander("📘 Complete strategy", expanded=False):
-    st.markdown(engine.strategy_markdown())
-with st.expander("⚙️ Symbol / security configuration", expanded=False):
-    st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
+with st.expander("📘 Complete strategy", expanded=False): st.markdown(engine.strategy_markdown())
+with st.expander("⚙️ Symbol / security configuration", expanded=False): st.dataframe(engine.config_table(), use_container_width=True, hide_index=True)
 
-if status.get("warning"):
-    st.warning(status["warning"])
-else:
-    st.success(f"Data status: {status.get('data_status', 'OK')}")
-
+if status.get("warning"): st.warning(status["warning"])
+else: st.success(f"Data status: {status.get('data_status', 'OK')}")
 st.caption(f"Dashboard time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
